@@ -10,8 +10,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
+import pandas as pd
 import xarray as xr
-from xclim.core.calendar import percentile_doy, resample_doy
+from xclim.core.calendar import adjust_doy_calendar, percentile_doy, resample_doy
+from xclim.core.utils import nan_calc_percentiles
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -32,6 +34,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--base-period-end", default="1972-12-31")
     parser.add_argument("--reference-result", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument(
+        "--engine",
+        default="xarray-loop",
+        choices=["xarray-loop", "numpy-index"],
+        help="Prototype implementation to run.",
+    )
     return parser.parse_args()
 
 
@@ -115,6 +123,185 @@ def _tg90p_bootstrap_count(
     return result
 
 
+def _tg90p_bootstrap_count_numpy_index(
+    da: xr.DataArray,
+    *,
+    base_period: tuple[str, str],
+) -> xr.DataArray:
+    study = da.load()
+    ref = study.sel(time=slice(*base_period))
+    values = np.asarray(study.transpose("time", ...).data)
+    ref_values = np.asarray(ref.transpose("time", ...).data)
+    flat_ref = ref_values.reshape(ref.sizes["time"], -1)
+    flat_study = values.reshape(study.sizes["time"], -1)
+
+    ref_time = pd.DatetimeIndex(ref.time.values)
+    study_time = pd.DatetimeIndex(study.time.values)
+    ref_year_indices = _indices_by_year(ref_time)
+    study_year_indices = _indices_by_year(study_time)
+    sample_indices = _rolling_sample_indices_by_doy(ref_time, window=5)
+    base_per = _percentiles_from_sample_indices(flat_ref, sample_indices)
+
+    pieces = []
+    for year, study_indices in study_year_indices.items():
+        year_da = study.isel(time=study_indices)
+        year_values = flat_study[study_indices]
+        if year in ref_year_indices:
+            donor_counts = []
+            for donor_year, donor_indices in ref_year_indices.items():
+                if donor_year == year:
+                    continue
+                remapped = _remap_target_year_indices(
+                    sample_indices,
+                    ref_time,
+                    ref_year_indices[year],
+                    donor_indices,
+                )
+                per = _percentiles_from_sample_indices(flat_ref, remapped)
+                donor_counts.append(
+                    _count_year_exceedances(
+                        year_values,
+                        per,
+                        year_da,
+                        study,
+                    ),
+                )
+            flat_count = np.mean(donor_counts, axis=0)
+        else:
+            flat_count = _count_year_exceedances(
+                year_values,
+                base_per,
+                year_da,
+                study,
+            )
+        pieces.append(flat_count.reshape(study.shape[1:]))
+
+    result = xr.DataArray(
+        np.stack(pieces, axis=0),
+        dims=study.dims,
+        coords={
+            "time": [np.datetime64(f"{year}-01-01") for year in study_year_indices],
+            **{coord: study.coords[coord] for coord in study.dims if coord != "time"},
+        },
+        name="TG90p",
+        attrs={"units": "d"},
+    )
+    for coord in study.coords:
+        if coord not in result.coords and "time" not in study[coord].dims:
+            result = result.assign_coords({coord: study[coord]})
+    return result.assign_coords(percentiles=90)
+
+
+def _indices_by_year(time: pd.DatetimeIndex) -> dict[int, np.ndarray]:
+    return {int(year): np.where(time.year == year)[0] for year in np.unique(time.year)}
+
+
+def _rolling_sample_indices_by_doy(
+    time: pd.DatetimeIndex,
+    *,
+    window: int,
+) -> dict[int, np.ndarray]:
+    half_window = window // 2
+    sample_indices: dict[int, list[int]] = {doy: [] for doy in range(1, 366)}
+    doys = time.dayofyear.to_numpy()
+    for center, doy in enumerate(doys):
+        if doy == 366:
+            continue
+        start = max(0, center - half_window)
+        stop = min(len(time), center + half_window + 1)
+        sample_indices[int(doy)].extend(range(start, stop))
+    return {
+        doy: np.asarray(indices, dtype=np.int64)
+        for doy, indices in sample_indices.items()
+    }
+
+
+def _remap_target_year_indices(
+    sample_indices: dict[int, np.ndarray],
+    ref_time: pd.DatetimeIndex,
+    target_indices: np.ndarray,
+    donor_indices: np.ndarray,
+) -> dict[int, np.ndarray]:
+    index_map = np.arange(len(ref_time), dtype=np.int64)
+    donor_map = _donor_indices_aligned_to_target(
+        ref_time[target_indices],
+        ref_time[donor_indices],
+        donor_indices,
+    )
+    index_map[target_indices] = donor_map
+    return {doy: index_map[indices] for doy, indices in sample_indices.items()}
+
+
+def _donor_indices_aligned_to_target(
+    target_time: pd.DatetimeIndex,
+    donor_time: pd.DatetimeIndex,
+    donor_indices: np.ndarray,
+) -> np.ndarray:
+    if len(target_time) == len(donor_time):
+        return donor_indices
+    donor_by_month_day = {
+        (int(month), int(day)): int(index)
+        for month, day, index in zip(
+            donor_time.month,
+            donor_time.day,
+            donor_indices,
+            strict=True,
+        )
+    }
+    # Missing dates, normally Feb 29 when injecting no-leap into leap, map to -1.
+    return np.asarray(
+        [
+            donor_by_month_day.get((int(month), int(day)), -1)
+            for month, day in zip(target_time.month, target_time.day, strict=True)
+        ],
+        dtype=np.int64,
+    )
+
+
+def _percentiles_from_sample_indices(
+    flat_ref: np.ndarray,
+    sample_indices: dict[int, np.ndarray],
+) -> np.ndarray:
+    out = np.empty((365, flat_ref.shape[1]), dtype=flat_ref.dtype)
+    for doy, indices in sample_indices.items():
+        valid = indices[indices >= 0]
+        samples = flat_ref[valid]
+        out[doy - 1] = nan_calc_percentiles(
+            samples,
+            percentiles=[90],
+            axis=0,
+            alpha=1.0 / 3.0,
+            beta=1.0 / 3.0,
+            copy=True,
+        )[:, 0]
+    return out
+
+
+def _count_year_exceedances(
+    year_values: np.ndarray,
+    percentile_by_doy: np.ndarray,
+    year_da: xr.DataArray,
+    template: xr.DataArray,
+) -> np.ndarray:
+    per_da = xr.DataArray(
+        percentile_by_doy.reshape((365, *template.shape[1:])),
+        dims=("dayofyear", *template.dims[1:]),
+        coords={
+            "dayofyear": np.arange(1, 366),
+            **{
+                coord: template.coords[coord]
+                for coord in template.dims
+                if coord != "time"
+            },
+        },
+    )
+    per_da = adjust_doy_calendar(per_da, template)
+    threshold = np.asarray(
+        resample_doy(per_da, year_da).transpose("time", ...).data,
+    ).reshape(year_da.sizes["time"], -1)
+    return np.sum(year_values > threshold, axis=0)
+
+
 def main() -> None:
     """Run the prototype and print a JSON summary."""
     args = _parse_args()
@@ -132,15 +319,22 @@ def main() -> None:
     )
     open_end = time.perf_counter()
     compute_start = time.perf_counter()
-    result = _tg90p_bootstrap_count(
-        da,
-        base_period=(args.base_period_start, args.base_period_end),
-    )
+    if args.engine == "xarray-loop":
+        result = _tg90p_bootstrap_count(
+            da,
+            base_period=(args.base_period_start, args.base_period_end),
+        )
+    else:
+        result = _tg90p_bootstrap_count_numpy_index(
+            da,
+            base_period=(args.base_period_start, args.base_period_end),
+        )
     result.load()
     compute_end = time.perf_counter()
 
     summary: dict[str, object] = {
         "open_seconds": open_end - open_start,
+        "engine": args.engine,
         "compute_seconds": compute_end - compute_start,
         "total_seconds": compute_end - open_start,
         "result_shape": tuple(int(x) for x in result.shape),
