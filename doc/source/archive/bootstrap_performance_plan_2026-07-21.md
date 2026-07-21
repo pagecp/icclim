@@ -1,52 +1,66 @@
-# Bootstrap Performance Plan (2026-07-21)
+# Bootstrap Reliability And Performance Notes (2026-07-21)
 
-## Goal
+This document records the bootstrap work done after PR #420 so future
+developers can continue from evidence instead of repeating the same
+experiments.
 
-Improve runtime for percentile count-index bootstrap without weakening the
-reliability safeguards merged in PR #420.
+For the broader scientific and numerical review, read
+`bootstrap_state_of_art_2026-07-21.md` before attempting new prototypes.
 
-The baseline is now:
+## Context
 
-- automatic safe tiling for dask-backed percentile count indices,
-- memory-budgeted tile sizing,
-- retry with smaller tiles on memory-like failures,
-- no huge dask graph returned to users.
+Percentile-based count indices such as `TG90P`, `TX90P`, and `TN90P` require
+bootstrap when the reference period overlaps the calculation period. The goal is
+not optional decoration: without bootstrap, the years inside the reference
+period can have biased percentile exceedance counts.
 
-Any optimized path must keep those safeguards or fall back to them.
+The immediate user problem was reliability:
 
-## Non-Negotiable Correctness Rules
+- dask-backed percentile bootstrap could build enormous graphs,
+- users had to guess chunking manually,
+- bad chunking could either exhaust memory or spend days building/executing a
+  graph and return nothing,
+- icclim v4's C backend was slow but usually finished, so icclim v7 needs the
+  same "eventually returns a result" property.
 
-1. `bootstrap=False` remains an explicit user shortcut for exploratory runs only.
-2. One-year, no-overlap, and all-overlap cases must not run bootstrap.
-3. Results must match the current exact bootstrap path within strict tolerance.
-4. Mean-only agreement is not enough: compare max absolute difference, changed
-   cells, and year-by-year differences.
-5. Do not change WSDI/CSDI or other spell-index behavior in the first
-   performance phase.
+PR #420 fixed reliability first. Performance work must not remove those
+safeguards.
 
-## Benchmark Matrix
+## Current Baseline
 
-Always compare the same dataset and chunking across:
+The merged reliability path now does the following for dask-backed percentile
+count indices:
 
-- `auto`: merged safe tiled behavior.
-- `legacy`: `ICCLIM_BOOTSTRAP_MODE=default`.
-- `false`: `bootstrap=False`, only as a speed/reference lower bound.
-- `candidate`: any optimized engine.
+- uses automatic safe spatial tiling,
+- derives tile size from `ICCLIM_BOOTSTRAP_SAFE_TILE_MEMORY`,
+- allows an expert override with `ICCLIM_BOOTSTRAP_SAFE_TILE_CELLS`,
+- retries with smaller tiles on memory-like failures,
+- returns a computed xarray object instead of handing users a huge dask graph,
+- keeps `ICCLIM_BOOTSTRAP_MODE=default` as a diagnostic way to force the old
+  xclim graph path,
+- keeps `bootstrap=False` as an explicit user shortcut only.
 
-Track:
+`bootstrap=False` is not scientifically equivalent. It is useful for fast
+exploration and lower-bound timing only.
 
-- wall time,
-- build time,
-- compute time,
-- graph task count,
-- safe tile count,
-- peak memory on Kraken,
-- result mean,
-- max absolute difference versus exact bootstrap.
+## Correctness Rules
 
-## Current Local Baseline
+Any optimized bootstrap path must satisfy these rules before production use:
 
-Local real-NetCDF TG90P subset:
+1. `bootstrap=False` remains user-selected only.
+2. One-year reference periods do not bootstrap.
+3. No-overlap periods do not bootstrap.
+4. All-overlap periods do not bootstrap because bootstrap is unnecessary.
+5. Mean agreement is not enough.
+6. Compare `max_abs_diff`, all changed cells, changed cells above `1e-9`, and
+   year/cell locations for meaningful changes.
+7. One-day flips must be investigated, not waved away.
+8. First optimize percentile count indices only; do not change `WSDI`, `CSDI`,
+   or spell-index behavior in the first performance phase.
+
+## Benchmark Data
+
+Local small TG90P benchmark:
 
 - file: `tas_day_MPI-ESM1-2-HR_historical_r1i1p1f1_gn_19700101-19741231.nc`
 - subset: `lat 35:45`, `lon 0:10`
@@ -54,167 +68,180 @@ Local real-NetCDF TG90P subset:
 - period: `1970-01-01` to `1974-12-31`
 - reference: `1970-01-01` to `1972-12-31`
 
-Measured on 2026-07-21:
+Kraken ACCESS-CM2 benchmark:
 
-- safe auto, `512MB`: `12.03s`, `graph_tasks=0`, mean `73.60082644628099`
-- legacy graph: `10.75s`, `graph_tasks=215188`, mean `73.60082644628099`
-- `bootstrap=False`: `10.33s`, `graph_tasks=47823`, mean `43.70578512396694`
+- file glob: `/scratch/globc/page/models/tas_day_ACCESS-CM2_historical_*.nc`
+- subset: `lat 35:70`, `lon 0:40`
+- resulting subset: `time=23741`, `lat=28`, `lon=21`
+- period: `1950-01-01` to `2014-12-31`
+- reference: `1961-01-01` to `1990-12-31`
+- chunks: `time=365`, `lat=24`, `lon=32`
 
-This confirms PR #420 is a reliability tradeoff, not a speedup.
+Kraken environment:
 
-## Highest-Probability Optimization Path
+- clone: `/scratch/globc/page/src/icclim`
+- Python: `/scratch/globc/page/.conda/envs/icclimv7/bin/python`
+- benchmark cache: `/scratch/globc/page/icclim-bench`
 
-Target only percentile count indices first (`TG90P`, `TX90P`, `TN90P`).
+## Benchmark Results
 
-The likely expensive operation is repeated percentile construction for each
-overlap year and donor-year replacement. A useful speedup probably requires an
-exact specialized count-index engine that avoids recomputing the full percentile
-sort from scratch for every donor/year.
+Local small TG90P results:
 
-Promising direction:
+| Candidate | Time | Exactness | Notes |
+| --- | ---: | --- | --- |
+| safe auto, `512MB` | `12.03s` | exact | Reliable, not faster. |
+| legacy graph | `10.75s` | exact | `215188` graph tasks. |
+| `bootstrap=False` | `10.33s` | not equivalent | Mean `43.70578512396694`. |
+| xarray donor-year loop | `11.14s` | exact | Only small local win. |
+| xarray donor-year loop, forced 3 tiles | `11.43s` | exact | Safe tiled path was `32.81s`. |
+| Numba full-sort prototype | `2.26s` warm compute | exact locally | First promising low-level path. |
+| Numba presorted replacement | `1.40s` warm compute | exact locally | Local-only win; rejected at scale. |
 
-1. Work tile-by-tile exactly like safe mode.
-2. For each day-of-year window and spatial cell, gather reference samples.
-3. Pre-sort reference samples once when possible.
-4. For each target year/donor replacement, compute the exact percentile threshold
-   from the adjusted sample set.
-5. Count exceedances and aggregate by output period.
-6. If unsupported calendar/dimension/chunking is encountered, fall back to safe
-   xclim bootstrap.
+Kraken ACCESS-CM2 full-subset results:
 
-## Rejected Or Low-Value Paths
-
-- Reintroducing the previous native-bootstrap branch as-is. It was useful for
-  learning, but it did not show a clear speed win against the merged baseline.
-- Optimizing graph construction alone. Earlier splice-builder work reduced task
-  count but did not improve end-to-end runtime.
-- Accepting numerical drift. Previous experiments showed that small-looking mean
-  differences can hide real local differences.
-
-## First Implementation Gate
-
-Before touching production runtime code, an optimized candidate must pass:
-
-- local TG90P benchmark faster than safe auto,
-- exact or near-exact comparison against legacy bootstrap,
-- leap-year and 2-year/3-year overlap tests,
-- no returned huge dask graph,
-- fallback path preserved.
+| Candidate | Time | Memory/Graph | Result | Status |
+| --- | ---: | --- | --- | --- |
+| `bootstrap=False` | `61.63s` | `23089` graph tasks | mean `43.74709576138147` | Lower-bound only. |
+| legacy xclim graph | `122.64s` total, `78.26s` compute | `4707056` graph tasks | mean `45.13441238564391` | Exact reference, risky graph. |
+| safe tiled path | cancelled after `~5m49s` | no huge returned graph | no result | Reliable but slow on this subset. |
+| xarray donor-year loop | cancelled after `~5m50s` | no huge returned graph | no result | Rejected. |
+| Numba full-sort prototype | `101.91s` total | about `1.1GB` observed earlier | mean `45.13414893808983` | Promising but not exact yet. |
+| Numba presorted replacement | `201.10s` total, `198.70s` compute | low-memory compiled path | mean `45.13414893808983` | Rejected; slower than full-sort. |
 
 ## Rejected Candidate: Xarray Donor-Year Loop
 
-Implemented and then removed a conservative exact fast path for annual
-percentile count indices:
+This candidate computed each bounded spatial tile in memory, reused xclim's
+`percentile_doy` and `resample_doy`, and avoided returning a huge dask graph.
 
-- only single day-of-year percentile thresholds,
-- only annual output for now,
-- only dask-backed count indices already routed through the safe bootstrap gate,
-- keeps the safe xclim tiled path available with `ICCLIM_BOOTSTRAP_MODE=safe`,
-- keeps the legacy xclim graph diagnostic path available with
-  `ICCLIM_BOOTSTRAP_MODE=default`,
-- falls back to safe xclim tiling for unsupported cases.
+Why it looked attractive:
 
-The candidate computes each bounded spatial tile in memory, reuses xclim's exact
-`percentile_doy` and `resample_doy` kernels, and avoids building a large dask
-graph. It also caches the raw studied array only when that raw array fits within
-`ICCLIM_BOOTSTRAP_SAFE_TILE_MEMORY`; bootstrap temporaries remain tiled.
+- exact on local small tests,
+- conceptually simple,
+- preserved fallback to safe tiling,
+- worked well when forced to avoid repeated tile reads locally.
 
-Local real-NetCDF TG90P subset, same data as above:
+Why it was rejected:
 
-- hostile chunks (`time=365`, `lat=4`, `lon=4`), one tile, `512MB`:
-  fast `11.14s`, safe `12.10s`, exact (`max_abs_diff=0`).
-- good spatial chunks (`time=365`, `lat=99`, `lon=99`), one tile, `512MB`:
-  fast `2.36s`, safe `2.47s`, exact.
-- hostile chunks, forced 3 tiles, `10MB`:
-  fast with raw cache `11.43s`, safe `32.81s`, exact.
+- it still calls `percentile_doy` for every target-year/donor-year pair,
+- realistic 30-year reference periods reintroduce the repeated percentile work,
+- Kraken did not finish the full benchmark within the useful window,
+- it is reliability-compatible but not a real performance path.
 
-Kraken 65-year TG90P benchmark:
+## Rejected Candidate: Numba Presorted Replacement
 
-- file glob: `/scratch/globc/page/models/tas_day_ACCESS-CM2_historical_*.nc`
-- subset: `lat=28`, `lon=21`, `time=23741`
-- chunks: `time=365`, `lat=24`, `lon=32`
-- `bootstrap=False`: `61.63s`, `graph_tasks=23089`, mean
-  `43.74709576138147`
-- legacy graph: `122.64s`, `graph_tasks=4707056`, mean
-  `45.13441238564391`
-- xarray donor-year fast candidate: cancelled after ~5m50s without completing
-  icclim execution
-- forced safe tiled path with default `2GB`: cancelled after ~5m49s without
-  completing icclim execution
+This candidate followed the original presort idea:
 
-Interpretation:
+- pre-sort base samples for each day-of-year and cell,
+- for each bootstrap replacement, remove target-year window values,
+- merge donor-year values,
+- compute the method-8 percentile from the adjusted sorted stream.
 
-- The arithmetic part is now very cheap on this subset; load/chunk topology is
-  the dominant cost.
-- Repeated tile reads were the major local multi-tile bottleneck. The raw-cache
-  guard removes that when the raw studied data fits the memory budget.
-- The xarray donor-year loop does not scale to realistic 30-year reference
-  periods because it calls `percentile_doy` for every target-year/donor-year
-  pair. This effectively reintroduces the expensive repeated percentile work we
-  are trying to remove.
-- Do not merge this production approach.
+Why it looked attractive:
 
-## Next Candidate
+- it directly attacks repeated sorting,
+- it was exact and faster on the small local case,
+- it kept memory low and avoided xarray object rebuilds.
 
-The next candidate must operate below the xarray donor-year loop:
+Why it was rejected:
 
-- load one bounded tile,
-- build reference rolling-window samples as compact NumPy arrays,
-- sort or partially sort samples once per day-of-year/cell,
-- compute each donor replacement threshold by removing target-year window
-  values and injecting donor-year window values without reconstructing a full
-  xarray object,
-- count exceedances directly on NumPy arrays,
-- wrap the result back into xarray only after computation,
-- compare exactly against legacy/safe outputs on local and Kraken data.
+- Kraken full benchmark was slower than both the Numba full-sort prototype and
+  the legacy graph path,
+- scalar remove/merge scans dominated more than expected,
+- sorting about 150 samples with simple insertion sort was cheaper than the
+  presorted adjustment machinery at realistic geometry.
 
-## Rejected Candidate: Presorted Replacement Prototype
+Keep the implementation in `scripts/prototype_bootstrap_count_tg90p.py` as a
+negative benchmark. Do not promote it to production as written.
 
-Implemented a second Numba prototype that follows the original presort idea:
+## Correctness Trap: One-Day Flips
 
-- precompute sorted base samples for each day-of-year and spatial cell,
-- for each target/donor bootstrap replacement, remove the target-year window
-  values and merge in the donor-year values,
-- compute the method-8 percentile from the adjusted sorted stream,
-- count exceedances directly in NumPy/Numba.
+The Numba prototypes match local small safe results, but Kraken comparisons show
+rare meaningful one-day flips against cached safe/legacy outputs.
 
-Local small TG90P benchmark:
+Observed fresh small-control differences before deeper investigation:
 
-- same local subset as above,
-- exact against the cached safe result (`max_abs_diff=0`),
-- warm compute time `1.40s`,
-- previous Numba full-sort prototype warm compute time `2.26s`.
+- two meaningful cells above `1e-9`,
+- both outside the reference period,
+- safe and `bootstrap=False` agreed with each other,
+- the Numba prototype gave one fewer day.
 
-Kraken 65-year TG90P benchmark:
+This means the issue is likely in reproducing icclim/xclim's prepared percentile
+threshold path, not in donor-year replacement itself.
 
-- same ACCESS-CM2 full subset as above,
-- compute time `198.70s`, total `201.10s`,
-- previous Numba full-sort prototype compute time `100.47s`,
-- legacy xclim graph compute time `78.26s`, total `122.64s`,
-- same result mean as the previous Numba prototype
-  (`45.13414893808983`), still not exactly matching the cached legacy result
-  (`max_abs_diff=1.0`).
+Important details:
 
-Interpretation:
+- icclim prepares percentile thresholds through `PercentileThreshold.prepare`.
+- xclim's `percentile_doy` may produce a 366-day day-of-year climatology when the
+  reference contains leap years.
+- `resample_doy` adjusts/reindexes based on the source day-of-year coordinate and
+  target time axis.
+- dask/output dtype behavior can matter: tiny threshold differences around
+  `1e-5` can flip a strict `>` comparison by one day.
 
-- The presort idea can help on very small local cases, but this implementation is
-  slower on realistic Kraken geometry.
-- Avoiding insertion sort is not enough; the scalar remove/merge scans dominate
-  at scale.
-- Do not promote this implementation to production.
-- Keep it as a benchmark harness candidate so future work can compare against it
-  without rebuilding the experiment.
+Future optimized production code should first reproduce the prepared threshold
+exactly for non-overlap years, because this isolates percentile construction
+from bootstrap replacement.
 
-Correctness note:
+## Useful Scripts
 
-- The apparent many-cell differences are mostly floating noise from annual
-  bootstrap means.
-- Meaningful differences are rare one-day flips and seem tied to reproducing
-  icclim/xclim's exact prepared percentile threshold path, including dask/dtype
-  behavior.
-- Any future optimized production path must compare with a tolerance summary
-  (`max_abs_diff`, changed cells, and changed cells above `1e-9`) and must
-  investigate one-day flips before merge.
+Use these scripts rather than ad-hoc notebooks:
 
-This is closer to the previous developer's original idea and has a better chance
-of real speedup because it attacks the repeated sort/rebuild cost directly.
+- `scripts/benchmark_bootstrap_tg90p.py`
+- `scripts/prototype_bootstrap_count_tg90p.py`
+- `scripts/compare_bootstrap_cached_outputs.py`
+- `scripts/slurm_benchmark_bootstrap_tg90p.sh`
+
+Recommended comparison fields:
+
+- wall time,
+- build time,
+- compute time,
+- graph task count,
+- safe tile count,
+- peak memory,
+- result mean,
+- `max_abs_diff`,
+- changed cells,
+- changed cells above `1e-9`,
+- coordinates of meaningful changed cells.
+
+## Next Ideas
+
+Priority 1: exact threshold reproduction.
+
+- Build a tiny diagnostic that compares icclim-prepared thresholds against the
+  optimized threshold arrays before counting.
+- Test dtype-sensitive variants, especially float32 output thresholds when the
+  source data is float32.
+- Do this first on non-overlap years, where bootstrap replacement is not active.
+
+Priority 2: improve the Numba full-sort prototype, not the presort prototype.
+
+- The full-sort prototype is the best speed signal so far on Kraken.
+- It avoids huge dask graphs and stayed low-memory.
+- Its simple insertion sort over small samples appears cache-friendly.
+- The next optimization should reduce duplicated threshold computation across
+  cells/years without adding scalar merge overhead.
+
+Priority 3: tile production integration only after exactness.
+
+- Production code must keep the safe tiled fallback.
+- The optimized path should be gated narrowly: daily day-of-year percentile,
+  annual count output, simple strict comparison, supported calendars only.
+- Unsupported cases should silently fall back to the safe xclim path.
+
+Priority 4: only then consider an xclim PR.
+
+- icclim should prove the implementation first.
+- Once exactness and reliability are demonstrated, the lower-level bootstrap
+  helper could be proposed back to xclim.
+
+## Do Not Repeat
+
+- Do not optimize only graph construction; it does not solve the user failure
+  mode by itself.
+- Do not accept mean-only agreement.
+- Do not use `bootstrap=False` as a correctness reference.
+- Do not merge a faster path that can silently change rare cells.
+- Do not assume the presorted idea is automatically faster; the Kraken result
+  showed the opposite for the tested implementation.
