@@ -168,5 +168,53 @@ The next candidate must operate below the xarray donor-year loop:
 - wrap the result back into xarray only after computation,
 - compare exactly against legacy/safe outputs on local and Kraken data.
 
+## Rejected Candidate: Presorted Replacement Prototype
+
+Implemented a second Numba prototype that follows the original presort idea:
+
+- precompute sorted base samples for each day-of-year and spatial cell,
+- for each target/donor bootstrap replacement, remove the target-year window
+  values and merge in the donor-year values,
+- compute the method-8 percentile from the adjusted sorted stream,
+- count exceedances directly in NumPy/Numba.
+
+Local small TG90P benchmark:
+
+- same local subset as above,
+- exact against the cached safe result (`max_abs_diff=0`),
+- warm compute time `1.40s`,
+- previous Numba full-sort prototype warm compute time `2.26s`.
+
+Kraken 65-year TG90P benchmark:
+
+- same ACCESS-CM2 full subset as above,
+- compute time `198.70s`, total `201.10s`,
+- previous Numba full-sort prototype compute time `100.47s`,
+- legacy xclim graph compute time `78.26s`, total `122.64s`,
+- same result mean as the previous Numba prototype
+  (`45.13414893808983`), still not exactly matching the cached legacy result
+  (`max_abs_diff=1.0`).
+
+Interpretation:
+
+- The presort idea can help on very small local cases, but this implementation is
+  slower on realistic Kraken geometry.
+- Avoiding insertion sort is not enough; the scalar remove/merge scans dominate
+  at scale.
+- Do not promote this implementation to production.
+- Keep it as a benchmark harness candidate so future work can compare against it
+  without rebuilding the experiment.
+
+Correctness note:
+
+- The apparent many-cell differences are mostly floating noise from annual
+  bootstrap means.
+- Meaningful differences are rare one-day flips and seem tied to reproducing
+  icclim/xclim's exact prepared percentile threshold path, including dask/dtype
+  behavior.
+- Any future optimized production path must compare with a tolerance summary
+  (`max_abs_diff`, changed cells, and changed cells above `1e-9`) and must
+  investigate one-day flips before merge.
+
 This is closer to the previous developer's original idea and has a better chance
 of real speedup because it attacks the repeated sort/rebuild cost directly.

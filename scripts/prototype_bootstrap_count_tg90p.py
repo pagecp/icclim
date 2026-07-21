@@ -38,7 +38,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--engine",
         default="xarray-loop",
-        choices=["xarray-loop", "numpy-index", "numpy-numba"],
+        choices=[
+            "xarray-loop",
+            "numpy-index",
+            "numpy-numba",
+            "numpy-numba-presort",
+        ],
         help="Prototype implementation to run.",
     )
     return parser.parse_args()
@@ -141,12 +146,18 @@ def _tg90p_bootstrap_count_numpy_index(
     ref_year_indices = _indices_by_year(ref_time)
     study_year_indices = _indices_by_year(study_time)
     sample_indices = _rolling_sample_index_matrix(ref_time, window=5)
+    source_max_doy = int(ref_time.dayofyear.max())
     base_per = _percentiles_from_sample_indices(flat_ref, sample_indices)
 
     pieces = []
     for year, study_indices in study_year_indices.items():
         year_da = study.isel(time=study_indices)
         year_values = flat_study[study_indices]
+        target_max_doy = (
+            source_max_doy
+            if source_max_doy == 366
+            else year_da.time.dt.dayofyear.max().item()
+        )
         if year in ref_year_indices:
             donor_counts = []
             for donor_year, donor_indices in ref_year_indices.items():
@@ -164,7 +175,7 @@ def _tg90p_bootstrap_count_numpy_index(
                         year_values,
                         per,
                         year_da.time.dt.dayofyear.to_numpy(),
-                        study.time.dt.dayofyear.max().item(),
+                        target_max_doy,
                     ),
                 )
             flat_count = np.mean(donor_counts, axis=0)
@@ -173,7 +184,7 @@ def _tg90p_bootstrap_count_numpy_index(
                 year_values,
                 base_per,
                 year_da.time.dt.dayofyear.to_numpy(),
-                study.time.dt.dayofyear.max().item(),
+                target_max_doy,
             )
         pieces.append(flat_count.reshape(study.shape[1:]))
 
@@ -222,6 +233,16 @@ def _tg90p_bootstrap_count_numpy_numba(
         [len(indices) for indices in study_year_indices.values()],
         dtype=np.int64,
     )
+    source_max_doy = int(ref_time.dayofyear.max())
+    study_threshold_max_doys = np.asarray(
+        [
+            source_max_doy
+            if source_max_doy == 366
+            else int(study_time[indices].dayofyear.max())
+            for indices in study_year_indices.values()
+        ],
+        dtype=np.int64,
+    )
     study_to_ref = np.asarray(
         [
             int(np.where(ref_years == year)[0][0]) if year in ref_year_indices else -1
@@ -235,7 +256,6 @@ def _tg90p_bootstrap_count_numpy_numba(
     )
     donor_aligned = _donor_alignment_matrix(ref_time, ref_year_indices)
     study_doys = study_time.dayofyear.to_numpy(dtype=np.int64)
-    max_target_doy = int(study_time.dayofyear.max())
 
     result = _bootstrap_counts_numba_kernel(
         flat_ref.astype(np.float64),
@@ -246,9 +266,99 @@ def _tg90p_bootstrap_count_numpy_numba(
         donor_aligned,
         study_starts,
         study_lengths,
+        study_threshold_max_doys,
         study_to_ref,
         study_doys,
-        max_target_doy,
+    )
+
+    data = result.reshape((len(study_years), *study.shape[1:]))
+    out = xr.DataArray(
+        data,
+        dims=study.dims,
+        coords={
+            "time": [np.datetime64(f"{year}-01-01") for year in study_years],
+            **{coord: study.coords[coord] for coord in study.dims if coord != "time"},
+        },
+        name="TG90p",
+        attrs={"units": "d"},
+    )
+    for coord in study.coords:
+        if coord not in out.coords and "time" not in study[coord].dims:
+            out = out.assign_coords({coord: study[coord]})
+    return out.assign_coords(percentiles=90)
+
+
+def _tg90p_bootstrap_count_numpy_numba_presort(
+    da: xr.DataArray,
+    *,
+    base_period: tuple[str, str],
+) -> xr.DataArray:
+    study = da.load()
+    ref = study.sel(time=slice(*base_period))
+    flat_ref = np.asarray(ref.transpose("time", ...).data).reshape(
+        ref.sizes["time"],
+        -1,
+    )
+    flat_study = np.asarray(study.transpose("time", ...).data).reshape(
+        study.sizes["time"],
+        -1,
+    )
+    ref_time = pd.DatetimeIndex(ref.time.values)
+    study_time = pd.DatetimeIndex(study.time.values)
+    ref_year_indices = _indices_by_year(ref_time)
+    study_year_indices = _indices_by_year(study_time)
+    ref_years = np.asarray(list(ref_year_indices), dtype=np.int64)
+    study_years = np.asarray(list(study_year_indices), dtype=np.int64)
+    study_starts = np.asarray(
+        [indices[0] for indices in study_year_indices.values()],
+        dtype=np.int64,
+    )
+    study_lengths = np.asarray(
+        [len(indices) for indices in study_year_indices.values()],
+        dtype=np.int64,
+    )
+    source_max_doy = int(ref_time.dayofyear.max())
+    study_threshold_max_doys = np.asarray(
+        [
+            source_max_doy
+            if source_max_doy == 366
+            else int(study_time[indices].dayofyear.max())
+            for indices in study_year_indices.values()
+        ],
+        dtype=np.int64,
+    )
+    study_to_ref = np.asarray(
+        [
+            int(np.where(ref_years == year)[0][0]) if year in ref_year_indices else -1
+            for year in study_years
+        ],
+        dtype=np.int64,
+    )
+    sample_indices = _rolling_sample_index_matrix(ref_time, window=5)
+    index_year, index_pos = _ref_index_year_and_position(
+        ref_year_indices, len(ref_time)
+    )
+    donor_aligned = _donor_alignment_matrix(ref_time, ref_year_indices)
+    study_doys = study_time.dayofyear.to_numpy(dtype=np.int64)
+    sorted_samples, sample_counts = _sorted_samples_from_sample_indices(
+        flat_ref.astype(np.float64),
+        sample_indices,
+    )
+
+    result = _bootstrap_counts_numba_presort_kernel(
+        flat_ref.astype(np.float64),
+        flat_study.astype(np.float64),
+        sample_indices,
+        sorted_samples,
+        sample_counts,
+        index_year,
+        index_pos,
+        donor_aligned,
+        study_starts,
+        study_lengths,
+        study_threshold_max_doys,
+        study_to_ref,
+        study_doys,
     )
 
     data = result.reshape((len(study_years), *study.shape[1:]))
@@ -322,9 +432,9 @@ if njit is not None:
         donor_aligned,
         study_starts,
         study_lengths,
+        study_max_doys,
         study_to_ref,
         study_doys,
-        max_target_doy,
     ):
         n_years = len(study_starts)
         n_cells = flat_study.shape[1]
@@ -335,6 +445,7 @@ if njit is not None:
             year_i = flat_i // n_cells
             cell = flat_i % n_cells
             target_ref_i = study_to_ref[year_i]
+            max_target_doy = study_max_doys[year_i]
             start = study_starts[year_i]
             length = study_lengths[year_i]
             if target_ref_i < 0:
@@ -465,6 +576,307 @@ if njit is not None:
             return q[lower + 1] - diff * (1.0 - gamma)
         return q[lower] + diff * gamma
 
+    @njit(parallel=True, cache=True)
+    def _bootstrap_counts_numba_presort_kernel(  # noqa: C901
+        flat_ref,
+        flat_study,
+        sample_indices,
+        sorted_samples,
+        sample_counts,
+        index_year,
+        index_pos,
+        donor_aligned,
+        study_starts,
+        study_lengths,
+        study_max_doys,
+        study_to_ref,
+        study_doys,
+    ):
+        n_years = len(study_starts)
+        n_cells = flat_study.shape[1]
+        out = np.empty((n_years, n_cells), dtype=np.float64)
+        n_ref_years = donor_aligned.shape[1]
+        max_samples = sample_indices.shape[1]
+        for flat_i in prange(n_years * n_cells):
+            year_i = flat_i // n_cells
+            cell = flat_i % n_cells
+            target_ref_i = study_to_ref[year_i]
+            max_target_doy = study_max_doys[year_i]
+            start = study_starts[year_i]
+            length = study_lengths[year_i]
+            if target_ref_i < 0:
+                q = np.empty(365, dtype=np.float64)
+                for doy_i in range(365):
+                    q[doy_i] = _method8_quantile_90_from_sorted(
+                        sorted_samples,
+                        sample_counts,
+                        doy_i,
+                        cell,
+                    )
+                count = 0.0
+                for offset in range(length):
+                    doy = study_doys[start + offset]
+                    threshold = _adjusted_threshold(q, doy, max_target_doy)
+                    if flat_study[start + offset, cell] > threshold:
+                        count += 1.0
+                out[year_i, cell] = count
+            else:
+                donor_total = 0.0
+                donor_count = 0
+                remove_buf = np.empty(max_samples, dtype=np.float64)
+                add_buf = np.empty(max_samples, dtype=np.float64)
+                used_remove = np.empty(max_samples, dtype=np.uint8)
+                q = np.empty(365, dtype=np.float64)
+                for donor_i in range(n_ref_years):
+                    if donor_i == target_ref_i:
+                        continue
+                    for doy_i in range(365):
+                        q[doy_i] = _quantile_for_doy_cell_from_presorted(
+                            flat_ref,
+                            sample_indices,
+                            sorted_samples,
+                            sample_counts,
+                            index_year,
+                            index_pos,
+                            donor_aligned,
+                            target_ref_i,
+                            donor_i,
+                            doy_i,
+                            cell,
+                            remove_buf,
+                            add_buf,
+                            used_remove,
+                        )
+                    count = 0.0
+                    for offset in range(length):
+                        doy = study_doys[start + offset]
+                        threshold = _adjusted_threshold(q, doy, max_target_doy)
+                        if flat_study[start + offset, cell] > threshold:
+                            count += 1.0
+                    donor_total += count
+                    donor_count += 1
+                out[year_i, cell] = donor_total / donor_count
+        return out
+
+    @njit(cache=True)
+    def _method8_quantile_90_from_sorted(
+        sorted_samples,
+        sample_counts,
+        doy_i,
+        cell,
+    ):
+        n = sample_counts[doy_i, cell]
+        if n == 0:
+            return np.nan
+        if n == 1:
+            return sorted_samples[doy_i, 0, cell]
+        q = 0.9
+        alpha = 1.0 / 3.0
+        beta = 1.0 / 3.0
+        virtual = n * q + (alpha + q * (1.0 - alpha - beta)) - 1.0
+        if virtual >= n - 1:
+            return sorted_samples[doy_i, n - 1, cell]
+        if virtual < 0:
+            return sorted_samples[doy_i, 0, cell]
+        previous = int(np.floor(virtual))
+        gamma = virtual - previous
+        left = sorted_samples[doy_i, previous, cell]
+        right = sorted_samples[doy_i, previous + 1, cell]
+        diff = right - left
+        if gamma >= 0.5:
+            return right - diff * (1.0 - gamma)
+        return left + diff * gamma
+
+    @njit(cache=True)
+    def _quantile_for_doy_cell_from_presorted(
+        flat_ref,
+        sample_indices,
+        sorted_samples,
+        sample_counts,
+        index_year,
+        index_pos,
+        donor_aligned,
+        target_ref_i,
+        donor_i,
+        doy_i,
+        cell,
+        remove_buf,
+        add_buf,
+        used_remove,
+    ):
+        n_remove = 0
+        n_add = 0
+        for sample_i in range(sample_indices.shape[1]):
+            ref_i = sample_indices[doy_i, sample_i]
+            if ref_i < 0:
+                continue
+            if index_year[ref_i] != target_ref_i:
+                continue
+            old_value = flat_ref[ref_i, cell]
+            if not np.isnan(old_value):
+                remove_buf[n_remove] = old_value
+                n_remove += 1
+            mapped_i = donor_aligned[target_ref_i, donor_i, index_pos[ref_i]]
+            if mapped_i >= 0:
+                new_value = flat_ref[mapped_i, cell]
+                if not np.isnan(new_value):
+                    add_buf[n_add] = new_value
+                    n_add += 1
+        _sort_prefix(add_buf, n_add)
+        n = sample_counts[doy_i, cell] - n_remove + n_add
+        return _method8_quantile_90_adjusted_sorted(
+            sorted_samples,
+            doy_i,
+            cell,
+            n,
+            remove_buf,
+            n_remove,
+            add_buf,
+            n_add,
+            used_remove,
+        )
+
+    @njit(cache=True)
+    def _method8_quantile_90_adjusted_sorted(
+        sorted_samples,
+        doy_i,
+        cell,
+        n,
+        remove_buf,
+        n_remove,
+        add_buf,
+        n_add,
+        used_remove,
+    ):
+        if n == 0:
+            return np.nan
+        if n == 1:
+            return _adjusted_sorted_value_at(
+                sorted_samples,
+                doy_i,
+                cell,
+                0,
+                remove_buf,
+                n_remove,
+                add_buf,
+                n_add,
+                used_remove,
+            )
+        q = 0.9
+        alpha = 1.0 / 3.0
+        beta = 1.0 / 3.0
+        virtual = n * q + (alpha + q * (1.0 - alpha - beta)) - 1.0
+        if virtual >= n - 1:
+            return _adjusted_sorted_value_at(
+                sorted_samples,
+                doy_i,
+                cell,
+                n - 1,
+                remove_buf,
+                n_remove,
+                add_buf,
+                n_add,
+                used_remove,
+            )
+        if virtual < 0:
+            return _adjusted_sorted_value_at(
+                sorted_samples,
+                doy_i,
+                cell,
+                0,
+                remove_buf,
+                n_remove,
+                add_buf,
+                n_add,
+                used_remove,
+            )
+        previous = int(np.floor(virtual))
+        gamma = virtual - previous
+        left = _adjusted_sorted_value_at(
+            sorted_samples,
+            doy_i,
+            cell,
+            previous,
+            remove_buf,
+            n_remove,
+            add_buf,
+            n_add,
+            used_remove,
+        )
+        right = _adjusted_sorted_value_at(
+            sorted_samples,
+            doy_i,
+            cell,
+            previous + 1,
+            remove_buf,
+            n_remove,
+            add_buf,
+            n_add,
+            used_remove,
+        )
+        diff = right - left
+        if gamma >= 0.5:
+            return right - diff * (1.0 - gamma)
+        return left + diff * gamma
+
+    @njit(cache=True)
+    def _adjusted_sorted_value_at(
+        sorted_samples,
+        doy_i,
+        cell,
+        rank,
+        remove_buf,
+        n_remove,
+        add_buf,
+        n_add,
+        used_remove,
+    ):
+        for i in range(n_remove):
+            used_remove[i] = 0
+        base_i = 0
+        add_i = 0
+        out_i = -1
+        base_n = sorted_samples.shape[1]
+        while base_i < base_n or add_i < n_add:
+            have_base = base_i < base_n and not np.isnan(
+                sorted_samples[doy_i, base_i, cell],
+            )
+            have_add = add_i < n_add
+            if not have_base and not have_add:
+                break
+            if have_add and (
+                not have_base or add_buf[add_i] <= sorted_samples[doy_i, base_i, cell]
+            ):
+                value = add_buf[add_i]
+                add_i += 1
+            else:
+                value = sorted_samples[doy_i, base_i, cell]
+                base_i += 1
+                if _consume_removed_value(value, remove_buf, used_remove, n_remove):
+                    continue
+            out_i += 1
+            if out_i == rank:
+                return value
+        return np.nan
+
+    @njit(cache=True)
+    def _consume_removed_value(value, remove_buf, used_remove, n_remove):
+        for remove_i in range(n_remove):
+            if used_remove[remove_i] == 0 and remove_buf[remove_i] == value:
+                used_remove[remove_i] = 1
+                return True
+        return False
+
+    @njit(cache=True)
+    def _sort_prefix(buf, n):
+        for i in range(1, n):
+            value = buf[i]
+            j = i - 1
+            while j >= 0 and buf[j] > value:
+                buf[j + 1] = buf[j]
+                j -= 1
+            buf[j + 1] = value
+
 else:
 
     def _bootstrap_counts_numba_kernel(*args, **kwargs):  # noqa: ARG001
@@ -561,6 +973,19 @@ def _percentiles_from_sample_indices(
     return percentiles[..., 0].T
 
 
+def _sorted_samples_from_sample_indices(
+    flat_ref: np.ndarray,
+    sample_indices: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    valid = sample_indices >= 0
+    safe_indices = np.where(valid, sample_indices, 0)
+    samples = flat_ref[safe_indices].astype(float, copy=True)
+    samples[~valid] = np.nan
+    samples.sort(axis=1)
+    counts = np.sum(~np.isnan(samples), axis=1, dtype=np.int64)
+    return samples, counts
+
+
 def _count_year_exceedances(
     year_values: np.ndarray,
     percentile_by_doy: np.ndarray,
@@ -613,8 +1038,13 @@ def main() -> None:
             da,
             base_period=(args.base_period_start, args.base_period_end),
         )
-    else:
+    elif args.engine == "numpy-numba":
         result = _tg90p_bootstrap_count_numpy_numba(
+            da,
+            base_period=(args.base_period_start, args.base_period_end),
+        )
+    else:
+        result = _tg90p_bootstrap_count_numpy_numba_presort(
             da,
             base_period=(args.base_period_start, args.base_period_end),
         )
@@ -641,6 +1071,7 @@ def main() -> None:
                 "reference_mean": float(reference.mean().item()),
                 "max_abs_diff": float(abs(diff).max().item()),
                 "changed_cells": int((abs(diff) > 0).sum().item()),
+                "changed_cells_gt_1e-9": int((abs(diff) > 1e-9).sum().item()),
             },
         )
     if args.output is not None:
