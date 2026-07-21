@@ -27,12 +27,11 @@ from time import perf_counter
 from typing import TYPE_CHECKING, Any, cast
 from warnings import warn
 
-import numpy as np
 import xarray as xr
 from numpy import abs as np_abs
 from numpy import diff as np_diff
 from numpy import median as np_median
-from pandas import Timedelta, Timestamp, date_range, infer_freq, to_timedelta
+from pandas import Timedelta, date_range, infer_freq, to_timedelta
 from xarray import DataArray
 from xarray.core.resample import DataArrayResample
 
@@ -58,6 +57,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from datetime import timedelta
 
+    import numpy as np
     from pint import Quantity
     from xarray.computation.rolling import DataArrayRolling
     from xarray.core.groupby import DataArrayGroupBy
@@ -71,8 +71,6 @@ if TYPE_CHECKING:
 _BOOTSTRAP_PROFILE: dict[str, float | int] = {}
 _DEFAULT_BOOTSTRAP_SAFE_TILE_MEMORY = "2GB"
 _BOOTSTRAP_SAFE_MEMORY_FACTOR = 12
-_DAYS_IN_NOLEAP_YEAR = 365
-_DAYS_IN_LEAP_YEAR = 366
 
 
 def reset_bootstrap_profile() -> None:
@@ -1316,16 +1314,6 @@ def _compute_safe_tiled_count_occurrences_with_max_cells(
     max_cells: int,
     safe_start: float,
 ) -> DataArray:
-    fast_result = _compute_fast_tiled_count_occurrences(
-        climate_var,
-        threshold,
-        resample_freq,
-        max_cells,
-        safe_start,
-    )
-    if fast_result is not None:
-        return fast_result
-
     tile_results: list[DataArray] = []
     for tile_indexers in _iter_spatial_tiles(climate_var.studied_data, max_cells):
         tile_start = perf_counter()
@@ -1362,232 +1350,6 @@ def _compute_safe_tiled_count_occurrences_with_max_cells(
         perf_counter() - safe_start,
     )
     return result
-
-
-def _compute_fast_tiled_count_occurrences(
-    climate_var: ClimateVariable,
-    threshold: PercentileThreshold,
-    resample_freq: Frequency,
-    max_cells: int,
-    safe_start: float,
-) -> DataArray | None:
-    if os.environ.get("ICCLIM_BOOTSTRAP_MODE") == "safe":
-        return None
-    if not _supports_fast_count_bootstrap(threshold, resample_freq):
-        return None
-
-    cached_study = _load_fast_bootstrap_study_cache(climate_var.studied_data)
-    tile_results: list[DataArray] = []
-    for tile_indexers in _iter_spatial_tiles(climate_var.studied_data, max_cells):
-        tile_start = perf_counter()
-        source_study = (
-            cached_study if cached_study is not None else climate_var.studied_data
-        )
-        tile_study = source_study.isel(tile_indexers)
-        tile_threshold = _slice_threshold_for_tile(threshold, tile_indexers)
-        tile_result = _compute_fast_count_bootstrap_tile(
-            tile_study,
-            tile_threshold,
-            resample_freq,
-        )
-        tile_results.append(tile_result.load())
-        _profile_bootstrap_inc("bootstrap_fast_tile_count")
-        _profile_bootstrap_add(
-            "bootstrap_fast_tile_seconds",
-            perf_counter() - tile_start,
-        )
-
-    if not tile_results:
-        return None
-    if len(tile_results) == 1:
-        result = tile_results[0]
-    else:
-        result = xr.combine_by_coords(
-            [tile.to_dataset(name="__icclim_bootstrap_tile") for tile in tile_results],
-            combine_attrs="override",
-        )["__icclim_bootstrap_tile"]
-    result.attrs.update(tile_results[-1].attrs)
-    _profile_bootstrap_add(
-        "bootstrap_fast_total_seconds",
-        perf_counter() - safe_start,
-    )
-    return result
-
-
-def _load_fast_bootstrap_study_cache(study: DataArray) -> DataArray | None:
-    if os.environ.get("ICCLIM_BOOTSTRAP_SAFE_TILE_CELLS"):
-        _profile_bootstrap_set("bootstrap_fast_raw_cache_disabled_by_tile_cells", 1)
-        return None
-    max_mem = _parse_byte_size(
-        os.environ.get(
-            "ICCLIM_BOOTSTRAP_SAFE_TILE_MEMORY",
-            _DEFAULT_BOOTSTRAP_SAFE_TILE_MEMORY,
-        )
-    )
-    raw_bytes = _estimate_array_bytes(study)
-    _profile_bootstrap_set("bootstrap_fast_raw_study_bytes", raw_bytes)
-    if raw_bytes > max_mem:
-        return None
-    load_start = perf_counter()
-    cached = study.chunk(dict.fromkeys(study.dims, -1)).load()
-    _profile_bootstrap_add(
-        "bootstrap_fast_raw_cache_load_seconds",
-        perf_counter() - load_start,
-    )
-    return cached
-
-
-def _estimate_array_bytes(da: DataArray) -> int:
-    itemsize = getattr(da.dtype, "itemsize", 8)
-    size = 1
-    for dim_size in da.sizes.values():
-        size *= max(1, dim_size)
-    return size * itemsize
-
-
-def _supports_fast_count_bootstrap(
-    threshold: PercentileThreshold,
-    resample_freq: Frequency,
-) -> bool:
-    if resample_freq != FrequencyRegistry.YEAR:
-        return False
-    if threshold.threshold_min_value is not None:
-        return False
-    if "percentiles" not in threshold.value.coords:
-        return False
-    if threshold.value["percentiles"].size != 1:
-        return False
-    return all(
-        attr in threshold.value.attrs
-        for attr in ("alpha", "beta", "climatology_bounds", "window")
-    )
-
-
-def _compute_fast_count_bootstrap_tile(
-    study: DataArray,
-    threshold: PercentileThreshold,
-    resample_freq: Frequency,
-) -> DataArray:
-    from xclim.core.calendar import percentile_doy, resample_doy  # noqa: PLC0415
-
-    per_da = threshold.value
-    clim = per_da.attrs["climatology_bounds"]
-    load_start = perf_counter()
-    loaded_study = (
-        study.chunk(dict.fromkeys(study.dims, -1)).load()
-        if _has_dask_graph(study)
-        else study
-    )
-    ref = loaded_study.sel(time=slice(*clim))
-    _profile_bootstrap_add(
-        "bootstrap_fast_load_seconds",
-        perf_counter() - load_start,
-    )
-    percentile = float(per_da["percentiles"].values.reshape(-1)[0])
-    pdoy_kwargs = {
-        "window": per_da.attrs["window"],
-        "per": percentile,
-        "alpha": per_da.attrs["alpha"],
-        "beta": per_da.attrs["beta"],
-        "copy": False,
-    }
-    base_per_start = perf_counter()
-    base_per = percentile_doy(ref, **pdoy_kwargs).squeeze("percentiles")
-    _profile_bootstrap_add(
-        "bootstrap_fast_base_percentile_seconds",
-        perf_counter() - base_per_start,
-    )
-    ref_groups = ref.resample(
-        time=_get_bootstrap_freq(resample_freq.pandas_freq)
-    ).groups
-    study_groups = loaded_study.resample(
-        time=_get_bootstrap_freq(resample_freq.pandas_freq)
-    ).groups
-    op = cast("Operator", threshold.operator).compute
-    pieces: list[DataArray] = []
-    for year_label, year_slice in study_groups.items():
-        year_da = loaded_study.isel(time=year_slice)
-        if _year_is_in_reference(year_label, ref):
-            donor_counts = []
-            for donor_label, donor_slice in ref_groups.items():
-                if donor_label == year_label:
-                    continue
-                donor_start = perf_counter()
-                boot_ref = _replace_bootstrap_year(
-                    ref,
-                    ref_groups,
-                    year_label,
-                    donor_slice,
-                )
-                boot_per = percentile_doy(boot_ref, **pdoy_kwargs).squeeze(
-                    "percentiles"
-                )
-                _profile_bootstrap_add(
-                    "bootstrap_fast_overlap_percentile_seconds",
-                    perf_counter() - donor_start,
-                )
-                count_start = perf_counter()
-                donor_counts.append(
-                    op(year_da, resample_doy(boot_per, year_da)).sum(dim="time")
-                )
-                _profile_bootstrap_add(
-                    "bootstrap_fast_count_seconds",
-                    perf_counter() - count_start,
-                )
-            value = xr.concat(donor_counts, dim="_bootstrap").mean(
-                dim="_bootstrap",
-                keep_attrs=True,
-            )
-        else:
-            count_start = perf_counter()
-            value = op(year_da, resample_doy(base_per, year_da)).sum(dim="time")
-            _profile_bootstrap_add(
-                "bootstrap_fast_count_seconds",
-                perf_counter() - count_start,
-            )
-        value = value.expand_dims(time=[year_label])
-        value = value.assign_coords(
-            percentiles=per_da["percentiles"].values.reshape(-1)[0]
-        )
-        pieces.append(value)
-    result = xr.concat(pieces, dim="time")
-    result.attrs["units"] = "d"
-    return result
-
-
-def _has_dask_graph(da: DataArray) -> bool:
-    return getattr(da.data, "__dask_graph__", None) is not None
-
-
-def _year_is_in_reference(label: object, reference: DataArray) -> bool:
-    return _get_year_value(label) in reference.get_index("time").year
-
-
-def _get_year_value(label: object) -> int:
-    if hasattr(label, "year"):
-        return int(label.year)
-    return int(Timestamp(label).year)
-
-
-def _replace_bootstrap_year(
-    reference: DataArray,
-    groups: dict[object, slice],
-    target_label: object,
-    donor_slice: slice,
-) -> DataArray:
-    target_time = reference.time[groups[target_label]]
-    donor = reference.isel(time=donor_slice)
-    out = reference.copy(deep=True)
-    if donor.sizes["time"] == target_time.size:
-        replacement = donor.data
-    elif target_time.size == _DAYS_IN_NOLEAP_YEAR:
-        replacement = donor.convert_calendar("noleap").data
-    elif target_time.size == _DAYS_IN_LEAP_YEAR:
-        replacement = donor.convert_calendar("366_day", missing=np.nan).data
-    else:
-        replacement = donor.data[: target_time.size]
-    out.loc[{"time": target_time}] = replacement
-    return out
 
 
 def _should_use_safe_count_bootstrap(climate_var: ClimateVariable) -> bool:

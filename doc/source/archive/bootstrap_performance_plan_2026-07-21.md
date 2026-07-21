@@ -101,9 +101,10 @@ Before touching production runtime code, an optimized candidate must pass:
 - no returned huge dask graph,
 - fallback path preserved.
 
-## Candidate Implemented On `perf/bootstrap-analysis`
+## Rejected Candidate: Xarray Donor-Year Loop
 
-Implemented a conservative exact fast path for annual percentile count indices:
+Implemented and then removed a conservative exact fast path for annual
+percentile count indices:
 
 - only single day-of-year percentile thresholds,
 - only annual output for now,
@@ -127,12 +128,45 @@ Local real-NetCDF TG90P subset, same data as above:
 - hostile chunks, forced 3 tiles, `10MB`:
   fast with raw cache `11.43s`, safe `32.81s`, exact.
 
+Kraken 65-year TG90P benchmark:
+
+- file glob: `/scratch/globc/page/models/tas_day_ACCESS-CM2_historical_*.nc`
+- subset: `lat=28`, `lon=21`, `time=23741`
+- chunks: `time=365`, `lat=24`, `lon=32`
+- `bootstrap=False`: `61.63s`, `graph_tasks=23089`, mean
+  `43.74709576138147`
+- legacy graph: `122.64s`, `graph_tasks=4707056`, mean
+  `45.13441238564391`
+- xarray donor-year fast candidate: cancelled after ~5m50s without completing
+  icclim execution
+- forced safe tiled path with default `2GB`: cancelled after ~5m49s without
+  completing icclim execution
+
 Interpretation:
 
 - The arithmetic part is now very cheap on this subset; load/chunk topology is
   the dominant cost.
 - Repeated tile reads were the major local multi-tile bottleneck. The raw-cache
   guard removes that when the raw studied data fits the memory budget.
-- This is a useful speedup for tiled reliability mode, but it is not yet a full
-  large-domain performance solution. Kraken-scale tests still need peak memory
-  and wall-time validation.
+- The xarray donor-year loop does not scale to realistic 30-year reference
+  periods because it calls `percentile_doy` for every target-year/donor-year
+  pair. This effectively reintroduces the expensive repeated percentile work we
+  are trying to remove.
+- Do not merge this production approach.
+
+## Next Candidate
+
+The next candidate must operate below the xarray donor-year loop:
+
+- load one bounded tile,
+- build reference rolling-window samples as compact NumPy arrays,
+- sort or partially sort samples once per day-of-year/cell,
+- compute each donor replacement threshold by removing target-year window
+  values and injecting donor-year window values without reconstructing a full
+  xarray object,
+- count exceedances directly on NumPy arrays,
+- wrap the result back into xarray only after computation,
+- compare exactly against legacy/safe outputs on local and Kraken data.
+
+This is closer to the previous developer's original idea and has a better chance
+of real speedup because it attacks the repeated sort/rebuild cost directly.
