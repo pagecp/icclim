@@ -182,6 +182,28 @@ Future optimized production code should first reproduce the prepared threshold
 exactly for non-overlap years, because this isolates percentile construction
 from bootstrap replacement.
 
+Follow-up result:
+
+- icclim's current threshold path is hybrid. Non-overlap years use thresholds
+  prepared from the original input units and then converted to the studied-data
+  unit. Bootstrap replacement years are recomputed by xclim's decorator from the
+  already-normalized comparison data.
+- The full-sort Numba prototype now mirrors this ordering. On the two Kraken
+  one-cell controls that previously failed, the hybrid prototype matches safe
+  output within floating tolerance (`changed_cells_gt_1e-9=0`).
+- A medium Kraken validation on an ACCESS-CM2 `8x8` grid also matched the safe
+  tiled output within floating tolerance: `changed_cells_gt_1e-9=0`,
+  `max_abs_diff=4.263256414560601e-14`, equal means
+  `43.815865384615385`.
+- On that same `8x8` subset, safe tiled runtime was about `199.91s` with two
+  tiles under `ICCLIM_BOOTSTRAP_SAFE_TILE_MEMORY=512MB`; the hybrid Numba
+  prototype runtime was about `60.73s`.
+- A full `28x21` hybrid prototype comparison against cached legacy output ran in
+  about `124.60s`, compared with the cached legacy runtime of about `122.64s`.
+  It reduced meaningful differences from the previous prototype but still had
+  three values above `1e-9` (`max_abs_diff=1.0`). Fresh one-cell safe controls
+  were submitted for those coordinates before drawing a final conclusion.
+
 ## Useful Scripts
 
 Use these scripts rather than ad-hoc notebooks:
@@ -207,13 +229,12 @@ Recommended comparison fields:
 
 ## Next Ideas
 
-Priority 1: exact threshold reproduction.
+Priority 1: larger-scale exactness validation.
 
-- Build a tiny diagnostic that compares icclim-prepared thresholds against the
-  optimized threshold arrays before counting.
-- Test dtype-sensitive variants, especially float32 output thresholds when the
-  source data is float32.
-- Do this first on non-overlap years, where bootstrap replacement is not active.
+- Compare the hybrid full-sort Numba prototype against cached safe outputs on
+  the ACCESS-CM2 subset.
+- Report `max_abs_diff`, `changed_cells_gt_1e-9`, wall time, and peak memory.
+- Inspect any remaining mismatches as one-cell controls before optimizing.
 
 Priority 2: improve the Numba full-sort prototype, not the presort prototype.
 

@@ -139,12 +139,15 @@ def _tg90p_bootstrap_count_numpy_index(
     da: xr.DataArray,
     *,
     base_period: tuple[str, str],
+    ref_da: xr.DataArray | None = None,
 ) -> xr.DataArray:
     study = da.load()
-    ref = study.sel(time=slice(*base_period))
+    ref = (ref_da if ref_da is not None else da).sel(time=slice(*base_period)).load()
     values = np.asarray(study.transpose("time", ...).data)
     ref_values = np.asarray(ref.transpose("time", ...).data)
+    boot_ref_values = np.asarray(study.sel(time=slice(*base_period)).transpose("time", ...).data)
     flat_ref = ref_values.reshape(ref.sizes["time"], -1)
+    flat_boot_ref = boot_ref_values.reshape(ref.sizes["time"], -1)
     flat_study = values.reshape(study.sizes["time"], -1)
 
     ref_time = pd.DatetimeIndex(ref.time.values)
@@ -175,7 +178,7 @@ def _tg90p_bootstrap_count_numpy_index(
                     ref_year_indices[year],
                     donor_indices,
                 )
-                per = _percentiles_from_sample_indices(flat_ref, remapped)
+                per = _percentiles_from_sample_indices(flat_boot_ref, remapped)
                 donor_counts.append(
                     _count_year_exceedances(
                         year_values,
@@ -188,7 +191,7 @@ def _tg90p_bootstrap_count_numpy_index(
         else:
             flat_count = _count_year_exceedances(
                 year_values,
-                base_per,
+                _convert_thresholds_like_icclim(base_per, ref, study),
                 year_da.time.dt.dayofyear.to_numpy(),
                 target_max_doy,
             )
@@ -214,10 +217,17 @@ def _tg90p_bootstrap_count_numpy_numba(
     da: xr.DataArray,
     *,
     base_period: tuple[str, str],
+    ref_da: xr.DataArray | None = None,
 ) -> xr.DataArray:
     study = da.load()
-    ref = study.sel(time=slice(*base_period))
+    ref = (ref_da if ref_da is not None else da).sel(time=slice(*base_period)).load()
     flat_ref = np.asarray(ref.transpose("time", ...).data).reshape(
+        ref.sizes["time"],
+        -1,
+    )
+    flat_boot_ref = np.asarray(
+        study.sel(time=slice(*base_period)).transpose("time", ...).data,
+    ).reshape(
         ref.sizes["time"],
         -1,
     )
@@ -265,6 +275,7 @@ def _tg90p_bootstrap_count_numpy_numba(
 
     result = _bootstrap_counts_numba_kernel(
         flat_ref.astype(np.float64),
+        flat_boot_ref.astype(np.float64),
         flat_study.astype(np.float64),
         sample_indices,
         index_year,
@@ -275,6 +286,7 @@ def _tg90p_bootstrap_count_numpy_numba(
         study_threshold_max_doys,
         study_to_ref,
         study_doys,
+        _threshold_unit_offset(ref, study),
     )
 
     data = result.reshape((len(study_years), *study.shape[1:]))
@@ -298,10 +310,17 @@ def _tg90p_bootstrap_count_numpy_numba_presort(
     da: xr.DataArray,
     *,
     base_period: tuple[str, str],
+    ref_da: xr.DataArray | None = None,
 ) -> xr.DataArray:
     study = da.load()
-    ref = study.sel(time=slice(*base_period))
+    ref = (ref_da if ref_da is not None else da).sel(time=slice(*base_period)).load()
     flat_ref = np.asarray(ref.transpose("time", ...).data).reshape(
+        ref.sizes["time"],
+        -1,
+    )
+    flat_boot_ref = np.asarray(
+        study.sel(time=slice(*base_period)).transpose("time", ...).data,
+    ).reshape(
         ref.sizes["time"],
         -1,
     )
@@ -350,13 +369,19 @@ def _tg90p_bootstrap_count_numpy_numba_presort(
         flat_ref.astype(np.float64),
         sample_indices,
     )
+    boot_sorted_samples, boot_sample_counts = _sorted_samples_from_sample_indices(
+        flat_boot_ref.astype(np.float64),
+        sample_indices,
+    )
 
     result = _bootstrap_counts_numba_presort_kernel(
-        flat_ref.astype(np.float64),
+        flat_boot_ref.astype(np.float64),
         flat_study.astype(np.float64),
         sample_indices,
         sorted_samples,
         sample_counts,
+        boot_sorted_samples,
+        boot_sample_counts,
         index_year,
         index_pos,
         donor_aligned,
@@ -365,6 +390,7 @@ def _tg90p_bootstrap_count_numpy_numba_presort(
         study_threshold_max_doys,
         study_to_ref,
         study_doys,
+        _threshold_unit_offset(ref, study),
     )
 
     data = result.reshape((len(study_years), *study.shape[1:]))
@@ -431,6 +457,7 @@ if njit is not None:
     @njit(parallel=True, cache=True)
     def _bootstrap_counts_numba_kernel(  # noqa: C901
         flat_ref,
+        flat_boot_ref,
         flat_study,
         sample_indices,
         index_year,
@@ -441,6 +468,7 @@ if njit is not None:
         study_max_doys,
         study_to_ref,
         study_doys,
+        threshold_offset,
     ):
         n_years = len(study_starts)
         n_cells = flat_study.shape[1]
@@ -458,17 +486,20 @@ if njit is not None:
                 q = np.empty(365, dtype=np.float64)
                 buf = np.empty(max_samples, dtype=np.float64)
                 for doy_i in range(365):
-                    q[doy_i] = _quantile_for_doy_cell(
-                        flat_ref,
-                        sample_indices,
-                        index_year,
-                        index_pos,
-                        donor_aligned,
-                        -1,
-                        -1,
-                        doy_i,
-                        cell,
-                        buf,
+                    q[doy_i] = np.float32(
+                        _quantile_for_doy_cell(
+                            flat_ref,
+                            sample_indices,
+                            index_year,
+                            index_pos,
+                            donor_aligned,
+                            -1,
+                            -1,
+                            doy_i,
+                            cell,
+                            buf,
+                        )
+                        + threshold_offset
                     )
                 count = 0.0
                 for offset in range(length):
@@ -486,17 +517,19 @@ if njit is not None:
                     q = np.empty(365, dtype=np.float64)
                     buf = np.empty(max_samples, dtype=np.float64)
                     for doy_i in range(365):
-                        q[doy_i] = _quantile_for_doy_cell(
-                            flat_ref,
-                            sample_indices,
-                            index_year,
-                            index_pos,
-                            donor_aligned,
-                            target_ref_i,
-                            donor_i,
-                            doy_i,
-                            cell,
-                            buf,
+                        q[doy_i] = np.float32(
+                            _quantile_for_doy_cell(
+                                flat_boot_ref,
+                                sample_indices,
+                                index_year,
+                                index_pos,
+                                donor_aligned,
+                                target_ref_i,
+                                donor_i,
+                                doy_i,
+                                cell,
+                                buf,
+                            )
                         )
                     count = 0.0
                     for offset in range(length):
@@ -584,11 +617,13 @@ if njit is not None:
 
     @njit(parallel=True, cache=True)
     def _bootstrap_counts_numba_presort_kernel(  # noqa: C901
-        flat_ref,
+        flat_boot_ref,
         flat_study,
         sample_indices,
         sorted_samples,
         sample_counts,
+        boot_sorted_samples,
+        boot_sample_counts,
         index_year,
         index_pos,
         donor_aligned,
@@ -597,6 +632,7 @@ if njit is not None:
         study_max_doys,
         study_to_ref,
         study_doys,
+        threshold_offset,
     ):
         n_years = len(study_starts)
         n_cells = flat_study.shape[1]
@@ -613,11 +649,14 @@ if njit is not None:
             if target_ref_i < 0:
                 q = np.empty(365, dtype=np.float64)
                 for doy_i in range(365):
-                    q[doy_i] = _method8_quantile_90_from_sorted(
-                        sorted_samples,
-                        sample_counts,
-                        doy_i,
-                        cell,
+                    q[doy_i] = np.float32(
+                        _method8_quantile_90_from_sorted(
+                            sorted_samples,
+                            sample_counts,
+                            doy_i,
+                            cell,
+                        )
+                        + threshold_offset
                     )
                 count = 0.0
                 for offset in range(length):
@@ -637,21 +676,24 @@ if njit is not None:
                     if donor_i == target_ref_i:
                         continue
                     for doy_i in range(365):
-                        q[doy_i] = _quantile_for_doy_cell_from_presorted(
-                            flat_ref,
-                            sample_indices,
-                            sorted_samples,
-                            sample_counts,
-                            index_year,
-                            index_pos,
-                            donor_aligned,
-                            target_ref_i,
-                            donor_i,
-                            doy_i,
-                            cell,
-                            remove_buf,
-                            add_buf,
-                            used_remove,
+                        q[doy_i] = np.float32(
+                            _quantile_for_doy_cell_from_presorted(
+                                flat_boot_ref,
+                                sample_indices,
+                                boot_sorted_samples,
+                                boot_sample_counts,
+                                index_year,
+                                index_pos,
+                                donor_aligned,
+                                target_ref_i,
+                                donor_i,
+                                doy_i,
+                                cell,
+                                remove_buf,
+                                add_buf,
+                                used_remove,
+                            )
+                            + threshold_offset
                         )
                     count = 0.0
                     for offset in range(length):
@@ -979,6 +1021,43 @@ def _percentiles_from_sample_indices(
     return percentiles[..., 0].T.astype(flat_ref.dtype, copy=False)
 
 
+def _threshold_unit_offset(ref: xr.DataArray, study: xr.DataArray) -> float:
+    """Return the additive threshold conversion used by this TG90P prototype."""
+    source = str(ref.attrs.get("units", "")).lower()
+    target = str(study.attrs.get("units", "")).lower()
+    kelvin_units = {"k", "kelvin", "degree_kelvin"}
+    celsius_units = {
+        "c",
+        "degc",
+        "degree_celsius",
+        "degrees_celsius",
+        "°c",
+    }
+    if source in kelvin_units and target in celsius_units:
+        return -273.15
+    if source == target or not source or not target:
+        return 0.0
+    msg = (
+        "This prototype only implements identity and Kelvin-to-Celsius threshold "
+        f"conversion, got {source!r} to {target!r}."
+    )
+    raise NotImplementedError(msg)
+
+
+def _convert_thresholds_like_icclim(
+    thresholds: np.ndarray,
+    ref: xr.DataArray,
+    study: xr.DataArray,
+) -> np.ndarray:
+    offset = _threshold_unit_offset(ref, study)
+    if offset == 0.0:
+        return thresholds
+    return (thresholds.astype(np.float64) + offset).astype(
+        study.dtype,
+        copy=False,
+    )
+
+
 def _sorted_samples_from_sample_indices(
     flat_ref: np.ndarray,
     sample_indices: np.ndarray,
@@ -1030,11 +1109,12 @@ def main() -> None:
 
     open_start = time.perf_counter()
     ds = xr.open_mfdataset(files, combine="by_coords")
-    da = ds["tas"].sel(
+    raw_da = ds["tas"].sel(
         lat=slice(args.lat_min, args.lat_max),
         lon=slice(args.lon_min, args.lon_max),
         time=slice(args.time_range_start, args.time_range_end),
     )
+    da = raw_da
     if args.target_unit:
         da = convert_units_to(da, args.target_unit)
     open_end = time.perf_counter()
@@ -1048,16 +1128,19 @@ def main() -> None:
         result = _tg90p_bootstrap_count_numpy_index(
             da,
             base_period=(args.base_period_start, args.base_period_end),
+            ref_da=raw_da,
         )
     elif args.engine == "numpy-numba":
         result = _tg90p_bootstrap_count_numpy_numba(
             da,
             base_period=(args.base_period_start, args.base_period_end),
+            ref_da=raw_da,
         )
     else:
         result = _tg90p_bootstrap_count_numpy_numba_presort(
             da,
             base_period=(args.base_period_start, args.base_period_end),
+            ref_da=raw_da,
         )
     result.load()
     compute_end = time.perf_counter()

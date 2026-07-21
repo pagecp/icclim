@@ -367,24 +367,44 @@ Follow-up exact-cell diagnostic:
   day-of-year thresholds.
 - Updating the prototype to convert `tas` to `degC` and cast native thresholds
   to float32 is necessary but not sufficient.
-- The remaining flip is caused by the native/eager percentile path differing
-  from xclim's dask percentile path. For cell A, the flip is on `1951-06-15`:
-  the data value is `20.037994384765625`, the saved full-pipeline threshold is
-  `20.037988662719727`, and the native threshold is
+- The first remaining flip was caused by threshold unit-conversion ordering. For
+  non-overlap years, icclim prepares percentile thresholds on the original data
+  units, then converts the prepared threshold to the studied-data unit. This is
+  not bitwise equivalent to converting the full input array to Celsius before
+  computing the percentile. For cell A, the flip is on `1951-06-15`: the data
+  value is `20.037994384765625`, the saved full-pipeline threshold is
+  `20.037988662719727`, and the converted-first native threshold is
   `20.037994384765625`.
-- Therefore a production fast path cannot use the current native percentile
-  kernel as-is if bitwise agreement with current icclim/xclim dask output is
-  required.
+- The second remaining flip was in a reference-period year (`1984`) and came
+  from the opposite path: xclim's `percentile_bootstrap` recomputes replacement
+  thresholds from the comparison data passed to the decorated function, which in
+  icclim is already Celsius-normalized. Therefore current icclim behavior is
+  hybrid:
+  non-overlap years use original-units percentile then threshold conversion;
+  bootstrap replacement years use normalized comparison data before percentile
+  computation.
+- Updating the prototype to reproduce this hybrid path made the two known
+  one-cell Kraken controls exact within floating tolerance:
+  `changed_cells_gt_1e-9=0` for both cell A and cell B.
+- A medium Kraken validation on an ACCESS-CM2 `8x8` subset also matched the
+  safe tiled output within floating tolerance: `changed_cells_gt_1e-9=0`,
+  `max_abs_diff=4.263256414560601e-14`.
+- A full `28x21` comparison against cached legacy output still had three values
+  above `1e-9`: `1961-07-02` at `(lat=64.375, lon=27.1875)`,
+  `1988-07-01` at `(lat=50.625, lon=6.5625)`, and `2012-07-01` at
+  `(lat=43.125, lon=15.9375)`. Fresh one-cell safe controls are required to
+  determine whether these are optimized-path differences or cached legacy
+  reference differences.
+- Therefore a production fast path must reproduce icclim's threshold preparation
+  and xclim bootstrap recomputation order, not only the Zhang replacement rule.
 
 Next diagnostic:
 
-- Investigate why xclim's dask `percentile_doy` path differs from eager/native
-  `percentile_doy` by `~1e-5` on float32 data.
-- Decide whether icclim's optimized path must reproduce the current dask output
-  exactly or whether icclim should define a dask-independent exact percentile
-  oracle for future releases.
-- Until that decision is made, do not merge the Numba bootstrap prototype as a
-  production optimization.
+- Run the hybrid prototype against larger multi-cell safe outputs.
+- If larger outputs remain exact, treat the full-sort Numba prototype as the
+  first viable fast-path candidate.
+- If larger outputs reveal new differences, add targeted one-cell diagnostics
+  before changing performance code.
 
 ## Source Links
 
