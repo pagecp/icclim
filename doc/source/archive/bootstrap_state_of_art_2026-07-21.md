@@ -320,6 +320,44 @@ Do this before any new production code:
 6. If still promising, integrate as a narrow production fast path with safe
    fallback.
 
+## Threshold Diagnostic Result
+
+Implemented `scripts/diagnose_bootstrap_thresholds.py` to compare percentile
+threshold construction paths before running bootstrap counts.
+
+The first results confirm a critical exactness detail:
+
+- `icclim` prepared thresholds match direct xclim thresholds when xclim is run
+  on the same dask-backed input.
+- Eager-loaded xclim thresholds differ from the dask-prepared threshold by about
+  `1e-5`.
+- The native NumPy threshold path used by the prototypes matches the eager-loaded
+  xclim path, not the dask-prepared icclim path.
+
+Local MPI-ESM subset:
+
+- `direct_xclim_dask`: `max_abs_diff=0`.
+- `direct_xclim_loaded`: `max_abs_diff=1.52587890625e-05`.
+- `native_numpy_loaded`: `max_abs_diff=1.52587890625e-05`.
+- No annual count flips for tested non-reference years `1970` and `2000`.
+
+Kraken ACCESS-CM2 small subset:
+
+- `direct_xclim_dask`: `max_abs_diff=0`.
+- `direct_xclim_loaded`: `max_abs_diff=1.4241536462122895e-05`.
+- `native_numpy_loaded`: `max_abs_diff=1.4241536462122895e-05`.
+- No annual count flips for tested non-reference years `1951` and `1952`.
+
+Interpretation:
+
+- Threshold construction path and dtype/chunk behavior are real, measurable
+  sources of numerical differences.
+- However, the remaining one-day Numba mismatches are not explained by the
+  aggregate threshold diagnostic alone.
+- Next diagnostic should compare one exact output cell/year/day between the
+  prototype annual count and icclim's safe result, including the time labels and
+  resampling bins used for the annual output.
+
 ## Source Links
 
 - Zhang et al. (2005), "Avoiding inhomogeneity in percentile-based indices of
