@@ -446,7 +446,10 @@ if njit is not None:
         gamma = virtual - previous
         left = buf[previous]
         right = buf[previous + 1]
-        return left + (right - left) * gamma
+        diff = right - left
+        if gamma >= 0.5:
+            return right - diff * (1.0 - gamma)
+        return left + diff * gamma
 
     @njit(cache=True)
     def _adjusted_threshold(q, doy, max_target_doy):
@@ -457,7 +460,10 @@ if njit is not None:
         if lower >= 364:
             return q[364]
         gamma = position - lower
-        return q[lower] + (q[lower + 1] - q[lower]) * gamma
+        diff = q[lower + 1] - q[lower]
+        if gamma >= 0.5:
+            return q[lower + 1] - diff * (1.0 - gamma)
+        return q[lower] + diff * gamma
 
 else:
 
