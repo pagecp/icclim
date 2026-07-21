@@ -357,23 +357,34 @@ Interpretation:
 
 Follow-up exact-cell diagnostic:
 
-- For the two cells that differed in the cached safe-vs-Numba comparison,
-  direct `PercentileThreshold.compute(..., bootstrap=False)` produced the same
-  counts as the Numba prototype: `39` for 1951 at `(lat=49.375, lon=25.3125)`
-  and `67` for 1952 at `(lat=51.875, lon=30.9375)`.
-- The cached `control-safe-small` and `control-false-small` outputs had `40` and
-  `68` for those same positional cells.
-- Therefore those cached control outputs should not be treated as exact oracles
-  until the full `icclim.index` pipeline/provenance difference is explained.
+- Fresh one-cell controls from the current branch reproduced the difference.
+- Cell A `(lat=49.375, lon=25.3125)`: safe and `bootstrap=False` both give `40`
+  for 1951; Numba gives `39`.
+- Cell B `(lat=51.875, lon=30.9375)`: safe and `bootstrap=False` both give `68`
+  for 1952; Numba gives `67`.
+- Saving thresholds from full `icclim.index(..., save_thresholds=True)` showed
+  that full-pipeline `TG90P` uses Celsius-standardized data and float32
+  day-of-year thresholds.
+- Updating the prototype to convert `tas` to `degC` and cast native thresholds
+  to float32 is necessary but not sufficient.
+- The remaining flip is caused by the native/eager percentile path differing
+  from xclim's dask percentile path. For cell A, the flip is on `1951-06-15`:
+  the data value is `20.037994384765625`, the saved full-pipeline threshold is
+  `20.037988662719727`, and the native threshold is
+  `20.037994384765625`.
+- Therefore a production fast path cannot use the current native percentile
+  kernel as-is if bitwise agreement with current icclim/xclim dask output is
+  required.
 
 Next diagnostic:
 
-- Recompute a fresh small `icclim.index(..., bootstrap=False)` result from the
-  current branch and compare it before and after frequency post-processing.
-- If the fresh full-pipeline result still differs from
-  `PercentileThreshold.compute`, inspect climate-variable preprocessing,
-  time-range/reference preparation order, and any standard-index specific
-  transformations.
+- Investigate why xclim's dask `percentile_doy` path differs from eager/native
+  `percentile_doy` by `~1e-5` on float32 data.
+- Decide whether icclim's optimized path must reproduce the current dask output
+  exactly or whether icclim should define a dask-independent exact percentile
+  oracle for future releases.
+- Until that decision is made, do not merge the Numba bootstrap prototype as a
+  production optimization.
 
 ## Source Links
 

@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from xclim.core.calendar import percentile_doy, resample_doy
+from xclim.core.units import convert_units_to
 from xclim.core.utils import nan_calc_percentiles
 
 if TYPE_CHECKING:
@@ -33,6 +34,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--time-range-end", default="1974-12-31")
     parser.add_argument("--base-period-start", default="1970-01-01")
     parser.add_argument("--base-period-end", default="1972-12-31")
+    parser.add_argument(
+        "--target-unit",
+        default="degC",
+        help="Unit used before computing TG90P, matching icclim standard indices.",
+    )
     parser.add_argument("--reference-result", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument(
@@ -530,7 +536,7 @@ if njit is not None:
             if not np.isnan(value):
                 buf[n] = value
                 n += 1
-        return _method8_quantile_90(buf, n)
+        return np.float32(_method8_quantile_90(buf, n))
 
     @njit(cache=True)
     def _method8_quantile_90(buf, n):
@@ -565,16 +571,16 @@ if njit is not None:
     @njit(cache=True)
     def _adjusted_threshold(q, doy, max_target_doy):
         if max_target_doy == 365:
-            return q[doy - 1]
+            return np.float32(q[doy - 1])
         position = (doy - 1.0) * 364.0 / 365.0
         lower = int(np.floor(position))
         if lower >= 364:
-            return q[364]
+            return np.float32(q[364])
         gamma = position - lower
         diff = q[lower + 1] - q[lower]
         if gamma >= 0.5:
-            return q[lower + 1] - diff * (1.0 - gamma)
-        return q[lower] + diff * gamma
+            return np.float32(q[lower + 1] - diff * (1.0 - gamma))
+        return np.float32(q[lower] + diff * gamma)
 
     @njit(parallel=True, cache=True)
     def _bootstrap_counts_numba_presort_kernel(  # noqa: C901
@@ -669,23 +675,23 @@ if njit is not None:
         if n == 0:
             return np.nan
         if n == 1:
-            return sorted_samples[doy_i, 0, cell]
+            return np.float32(sorted_samples[doy_i, 0, cell])
         q = 0.9
         alpha = 1.0 / 3.0
         beta = 1.0 / 3.0
         virtual = n * q + (alpha + q * (1.0 - alpha - beta)) - 1.0
         if virtual >= n - 1:
-            return sorted_samples[doy_i, n - 1, cell]
+            return np.float32(sorted_samples[doy_i, n - 1, cell])
         if virtual < 0:
-            return sorted_samples[doy_i, 0, cell]
+            return np.float32(sorted_samples[doy_i, 0, cell])
         previous = int(np.floor(virtual))
         gamma = virtual - previous
         left = sorted_samples[doy_i, previous, cell]
         right = sorted_samples[doy_i, previous + 1, cell]
         diff = right - left
         if gamma >= 0.5:
-            return right - diff * (1.0 - gamma)
-        return left + diff * gamma
+            return np.float32(right - diff * (1.0 - gamma))
+        return np.float32(left + diff * gamma)
 
     @njit(cache=True)
     def _quantile_for_doy_cell_from_presorted(
@@ -724,7 +730,7 @@ if njit is not None:
                     n_add += 1
         _sort_prefix(add_buf, n_add)
         n = sample_counts[doy_i, cell] - n_remove + n_add
-        return _method8_quantile_90_adjusted_sorted(
+        return np.float32(_method8_quantile_90_adjusted_sorted(
             sorted_samples,
             doy_i,
             cell,
@@ -734,7 +740,7 @@ if njit is not None:
             add_buf,
             n_add,
             used_remove,
-        )
+        ))
 
     @njit(cache=True)
     def _method8_quantile_90_adjusted_sorted(
@@ -970,7 +976,7 @@ def _percentiles_from_sample_indices(
         beta=1.0 / 3.0,
         copy=False,
     )
-    return percentiles[..., 0].T
+    return percentiles[..., 0].T.astype(flat_ref.dtype, copy=False)
 
 
 def _sorted_samples_from_sample_indices(
@@ -1005,7 +1011,10 @@ def _adjust_365_percentiles_to_target(
         return percentile_by_doy
     source_x = np.linspace(1, max_target_doy, num=percentile_by_doy.shape[0])
     target_x = np.arange(1, max_target_doy + 1)
-    adjusted = np.empty((max_target_doy, percentile_by_doy.shape[1]))
+    adjusted = np.empty(
+        (max_target_doy, percentile_by_doy.shape[1]),
+        dtype=percentile_by_doy.dtype,
+    )
     for cell in range(percentile_by_doy.shape[1]):
         adjusted[:, cell] = np.interp(target_x, source_x, percentile_by_doy[:, cell])
     return adjusted
@@ -1026,6 +1035,8 @@ def main() -> None:
         lon=slice(args.lon_min, args.lon_max),
         time=slice(args.time_range_start, args.time_range_end),
     )
+    if args.target_unit:
+        da = convert_units_to(da, args.target_unit)
     open_end = time.perf_counter()
     compute_start = time.perf_counter()
     if args.engine == "xarray-loop":
