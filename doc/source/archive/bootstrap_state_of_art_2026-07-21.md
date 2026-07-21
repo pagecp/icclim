@@ -352,11 +352,28 @@ Interpretation:
 
 - Threshold construction path and dtype/chunk behavior are real, measurable
   sources of numerical differences.
-- However, the remaining one-day Numba mismatches are not explained by the
+- However, the remaining one-day Numba mismatches were not explained by the
   aggregate threshold diagnostic alone.
-- Next diagnostic should compare one exact output cell/year/day between the
-  prototype annual count and icclim's safe result, including the time labels and
-  resampling bins used for the annual output.
+
+Follow-up exact-cell diagnostic:
+
+- For the two cells that differed in the cached safe-vs-Numba comparison,
+  direct `PercentileThreshold.compute(..., bootstrap=False)` produced the same
+  counts as the Numba prototype: `39` for 1951 at `(lat=49.375, lon=25.3125)`
+  and `67` for 1952 at `(lat=51.875, lon=30.9375)`.
+- The cached `control-safe-small` and `control-false-small` outputs had `40` and
+  `68` for those same positional cells.
+- Therefore those cached control outputs should not be treated as exact oracles
+  until the full `icclim.index` pipeline/provenance difference is explained.
+
+Next diagnostic:
+
+- Recompute a fresh small `icclim.index(..., bootstrap=False)` result from the
+  current branch and compare it before and after frequency post-processing.
+- If the fresh full-pipeline result still differs from
+  `PercentileThreshold.compute`, inspect climate-variable preprocessing,
+  time-range/reference preparation order, and any standard-index specific
+  transformations.
 
 ## Source Links
 
