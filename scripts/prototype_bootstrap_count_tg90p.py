@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pandas as pd
 import xarray as xr
-from xclim.core.calendar import adjust_doy_calendar, percentile_doy, resample_doy
+from xclim.core.calendar import percentile_doy, resample_doy
 from xclim.core.utils import nan_calc_percentiles
 
 if TYPE_CHECKING:
@@ -162,8 +162,8 @@ def _tg90p_bootstrap_count_numpy_index(
                     _count_year_exceedances(
                         year_values,
                         per,
-                        year_da,
-                        study,
+                        year_da.time.dt.dayofyear.to_numpy(),
+                        study.time.dt.dayofyear.max().item(),
                     ),
                 )
             flat_count = np.mean(donor_counts, axis=0)
@@ -171,8 +171,8 @@ def _tg90p_bootstrap_count_numpy_index(
             flat_count = _count_year_exceedances(
                 year_values,
                 base_per,
-                year_da,
-                study,
+                year_da.time.dt.dayofyear.to_numpy(),
+                study.time.dt.dayofyear.max().item(),
             )
         pieces.append(flat_count.reshape(study.shape[1:]))
 
@@ -280,26 +280,26 @@ def _percentiles_from_sample_indices(
 def _count_year_exceedances(
     year_values: np.ndarray,
     percentile_by_doy: np.ndarray,
-    year_da: xr.DataArray,
-    template: xr.DataArray,
+    year_doys: np.ndarray,
+    max_target_doy: int,
 ) -> np.ndarray:
-    per_da = xr.DataArray(
-        percentile_by_doy.reshape((365, *template.shape[1:])),
-        dims=("dayofyear", *template.dims[1:]),
-        coords={
-            "dayofyear": np.arange(1, 366),
-            **{
-                coord: template.coords[coord]
-                for coord in template.dims
-                if coord != "time"
-            },
-        },
-    )
-    per_da = adjust_doy_calendar(per_da, template)
-    threshold = np.asarray(
-        resample_doy(per_da, year_da).transpose("time", ...).data,
-    ).reshape(year_da.sizes["time"], -1)
+    adjusted = _adjust_365_percentiles_to_target(percentile_by_doy, max_target_doy)
+    threshold = adjusted[year_doys - 1]
     return np.sum(year_values > threshold, axis=0)
+
+
+def _adjust_365_percentiles_to_target(
+    percentile_by_doy: np.ndarray,
+    max_target_doy: int,
+) -> np.ndarray:
+    if max_target_doy == 365:
+        return percentile_by_doy
+    source_x = np.linspace(1, max_target_doy, num=percentile_by_doy.shape[0])
+    target_x = np.arange(1, max_target_doy + 1)
+    adjusted = np.empty((max_target_doy, percentile_by_doy.shape[1]))
+    for cell in range(percentile_by_doy.shape[1]):
+        adjusted[:, cell] = np.interp(target_x, source_x, percentile_by_doy[:, cell])
+    return adjusted
 
 
 def main() -> None:
