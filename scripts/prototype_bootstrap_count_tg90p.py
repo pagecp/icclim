@@ -1,4 +1,5 @@
 """Prototype an exact TG90p bootstrap count engine outside icclim runtime."""
+# ruff: noqa: ANN001, ANN202
 
 from __future__ import annotations
 
@@ -37,7 +38,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--engine",
         default="xarray-loop",
-        choices=["xarray-loop", "numpy-index"],
+        choices=["xarray-loop", "numpy-index", "numpy-numba"],
         help="Prototype implementation to run.",
     )
     return parser.parse_args()
@@ -192,6 +193,279 @@ def _tg90p_bootstrap_count_numpy_index(
     return result.assign_coords(percentiles=90)
 
 
+def _tg90p_bootstrap_count_numpy_numba(
+    da: xr.DataArray,
+    *,
+    base_period: tuple[str, str],
+) -> xr.DataArray:
+    study = da.load()
+    ref = study.sel(time=slice(*base_period))
+    flat_ref = np.asarray(ref.transpose("time", ...).data).reshape(
+        ref.sizes["time"],
+        -1,
+    )
+    flat_study = np.asarray(study.transpose("time", ...).data).reshape(
+        study.sizes["time"],
+        -1,
+    )
+    ref_time = pd.DatetimeIndex(ref.time.values)
+    study_time = pd.DatetimeIndex(study.time.values)
+    ref_year_indices = _indices_by_year(ref_time)
+    study_year_indices = _indices_by_year(study_time)
+    ref_years = np.asarray(list(ref_year_indices), dtype=np.int64)
+    study_years = np.asarray(list(study_year_indices), dtype=np.int64)
+    study_starts = np.asarray(
+        [indices[0] for indices in study_year_indices.values()],
+        dtype=np.int64,
+    )
+    study_lengths = np.asarray(
+        [len(indices) for indices in study_year_indices.values()],
+        dtype=np.int64,
+    )
+    study_to_ref = np.asarray(
+        [
+            int(np.where(ref_years == year)[0][0]) if year in ref_year_indices else -1
+            for year in study_years
+        ],
+        dtype=np.int64,
+    )
+    sample_indices = _rolling_sample_index_matrix(ref_time, window=5)
+    index_year, index_pos = _ref_index_year_and_position(
+        ref_year_indices, len(ref_time)
+    )
+    donor_aligned = _donor_alignment_matrix(ref_time, ref_year_indices)
+    study_doys = study_time.dayofyear.to_numpy(dtype=np.int64)
+    max_target_doy = int(study_time.dayofyear.max())
+
+    result = _bootstrap_counts_numba_kernel(
+        flat_ref.astype(np.float64),
+        flat_study.astype(np.float64),
+        sample_indices,
+        index_year,
+        index_pos,
+        donor_aligned,
+        study_starts,
+        study_lengths,
+        study_to_ref,
+        study_doys,
+        max_target_doy,
+    )
+
+    data = result.reshape((len(study_years), *study.shape[1:]))
+    out = xr.DataArray(
+        data,
+        dims=study.dims,
+        coords={
+            "time": [np.datetime64(f"{year}-01-01") for year in study_years],
+            **{coord: study.coords[coord] for coord in study.dims if coord != "time"},
+        },
+        name="TG90p",
+        attrs={"units": "d"},
+    )
+    for coord in study.coords:
+        if coord not in out.coords and "time" not in study[coord].dims:
+            out = out.assign_coords({coord: study[coord]})
+    return out.assign_coords(percentiles=90)
+
+
+def _ref_index_year_and_position(
+    ref_year_indices: dict[int, np.ndarray],
+    n_ref_time: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    index_year = np.full(n_ref_time, -1, dtype=np.int64)
+    index_pos = np.full(n_ref_time, -1, dtype=np.int64)
+    for year_index, indices in enumerate(ref_year_indices.values()):
+        index_year[indices] = year_index
+        index_pos[indices] = np.arange(len(indices), dtype=np.int64)
+    return index_year, index_pos
+
+
+def _donor_alignment_matrix(
+    ref_time: pd.DatetimeIndex,
+    ref_year_indices: dict[int, np.ndarray],
+) -> np.ndarray:
+    max_year_len = max(len(indices) for indices in ref_year_indices.values())
+    n_years = len(ref_year_indices)
+    aligned = np.full((n_years, n_years, max_year_len), -1, dtype=np.int64)
+    years = list(ref_year_indices)
+    for target_i, target_year in enumerate(years):
+        target_indices = ref_year_indices[target_year]
+        target_time = ref_time[target_indices]
+        for donor_i, donor_year in enumerate(years):
+            donor_indices = ref_year_indices[donor_year]
+            aligned[target_i, donor_i, : len(target_indices)] = (
+                _donor_indices_aligned_to_target(
+                    target_time,
+                    ref_time[donor_indices],
+                    donor_indices,
+                )
+            )
+    return aligned
+
+
+try:
+    from numba import njit, prange
+except Exception:  # noqa: BLE001
+    njit = None
+    prange = range
+
+
+if njit is not None:
+
+    @njit(parallel=True, cache=True)
+    def _bootstrap_counts_numba_kernel(  # noqa: C901
+        flat_ref,
+        flat_study,
+        sample_indices,
+        index_year,
+        index_pos,
+        donor_aligned,
+        study_starts,
+        study_lengths,
+        study_to_ref,
+        study_doys,
+        max_target_doy,
+    ):
+        n_years = len(study_starts)
+        n_cells = flat_study.shape[1]
+        out = np.empty((n_years, n_cells), dtype=np.float64)
+        n_ref_years = donor_aligned.shape[1]
+        max_samples = sample_indices.shape[1]
+        for flat_i in prange(n_years * n_cells):
+            year_i = flat_i // n_cells
+            cell = flat_i % n_cells
+            target_ref_i = study_to_ref[year_i]
+            start = study_starts[year_i]
+            length = study_lengths[year_i]
+            if target_ref_i < 0:
+                q = np.empty(365, dtype=np.float64)
+                buf = np.empty(max_samples, dtype=np.float64)
+                for doy_i in range(365):
+                    q[doy_i] = _quantile_for_doy_cell(
+                        flat_ref,
+                        sample_indices,
+                        index_year,
+                        index_pos,
+                        donor_aligned,
+                        -1,
+                        -1,
+                        doy_i,
+                        cell,
+                        buf,
+                    )
+                count = 0.0
+                for offset in range(length):
+                    doy = study_doys[start + offset]
+                    threshold = _adjusted_threshold(q, doy, max_target_doy)
+                    if flat_study[start + offset, cell] > threshold:
+                        count += 1.0
+                out[year_i, cell] = count
+            else:
+                donor_total = 0.0
+                donor_count = 0
+                for donor_i in range(n_ref_years):
+                    if donor_i == target_ref_i:
+                        continue
+                    q = np.empty(365, dtype=np.float64)
+                    buf = np.empty(max_samples, dtype=np.float64)
+                    for doy_i in range(365):
+                        q[doy_i] = _quantile_for_doy_cell(
+                            flat_ref,
+                            sample_indices,
+                            index_year,
+                            index_pos,
+                            donor_aligned,
+                            target_ref_i,
+                            donor_i,
+                            doy_i,
+                            cell,
+                            buf,
+                        )
+                    count = 0.0
+                    for offset in range(length):
+                        doy = study_doys[start + offset]
+                        threshold = _adjusted_threshold(q, doy, max_target_doy)
+                        if flat_study[start + offset, cell] > threshold:
+                            count += 1.0
+                    donor_total += count
+                    donor_count += 1
+                out[year_i, cell] = donor_total / donor_count
+        return out
+
+    @njit(cache=True)
+    def _quantile_for_doy_cell(
+        flat_ref,
+        sample_indices,
+        index_year,
+        index_pos,
+        donor_aligned,
+        target_ref_i,
+        donor_i,
+        doy_i,
+        cell,
+        buf,
+    ):
+        n = 0
+        for sample_i in range(sample_indices.shape[1]):
+            ref_i = sample_indices[doy_i, sample_i]
+            if ref_i < 0:
+                continue
+            mapped_i = ref_i
+            if target_ref_i >= 0 and index_year[ref_i] == target_ref_i:
+                mapped_i = donor_aligned[target_ref_i, donor_i, index_pos[ref_i]]
+            if mapped_i < 0:
+                continue
+            value = flat_ref[mapped_i, cell]
+            if not np.isnan(value):
+                buf[n] = value
+                n += 1
+        return _method8_quantile_90(buf, n)
+
+    @njit(cache=True)
+    def _method8_quantile_90(buf, n):
+        if n == 0:
+            return np.nan
+        if n == 1:
+            return buf[0]
+        for i in range(1, n):
+            value = buf[i]
+            j = i - 1
+            while j >= 0 and buf[j] > value:
+                buf[j + 1] = buf[j]
+                j -= 1
+            buf[j + 1] = value
+        q = 0.9
+        alpha = 1.0 / 3.0
+        beta = 1.0 / 3.0
+        virtual = n * q + (alpha + q * (1.0 - alpha - beta)) - 1.0
+        if virtual >= n - 1:
+            return buf[n - 1]
+        if virtual < 0:
+            return buf[0]
+        previous = int(np.floor(virtual))
+        gamma = virtual - previous
+        left = buf[previous]
+        right = buf[previous + 1]
+        return left + (right - left) * gamma
+
+    @njit(cache=True)
+    def _adjusted_threshold(q, doy, max_target_doy):
+        if max_target_doy == 365:
+            return q[doy - 1]
+        position = (doy - 1.0) * 364.0 / 365.0
+        lower = int(np.floor(position))
+        if lower >= 364:
+            return q[364]
+        gamma = position - lower
+        return q[lower] + (q[lower + 1] - q[lower]) * gamma
+
+else:
+
+    def _bootstrap_counts_numba_kernel(*args, **kwargs):  # noqa: ARG001
+        msg = "numba is required for --engine numpy-numba"
+        raise RuntimeError(msg)
+
+
 def _indices_by_year(time: pd.DatetimeIndex) -> dict[int, np.ndarray]:
     return {int(year): np.where(time.year == year)[0] for year in np.unique(time.year)}
 
@@ -328,8 +602,13 @@ def main() -> None:
             da,
             base_period=(args.base_period_start, args.base_period_end),
         )
-    else:
+    elif args.engine == "numpy-index":
         result = _tg90p_bootstrap_count_numpy_index(
+            da,
+            base_period=(args.base_period_start, args.base_period_end),
+        )
+    else:
+        result = _tg90p_bootstrap_count_numpy_numba(
             da,
             base_period=(args.base_period_start, args.base_period_end),
         )
