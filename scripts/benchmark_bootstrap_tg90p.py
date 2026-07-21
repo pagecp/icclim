@@ -60,7 +60,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--bootstrap-mode",
         default=None,
-        choices=["default"],
+        choices=["default", "safe"],
         help="Set ICCLIM_BOOTSTRAP_MODE for diagnostics, e.g. default for legacy graph path.",
     )
     parser.add_argument(

@@ -767,7 +767,7 @@ class TestIntegration:
 
         assert REFERENCE_PERIOD_ID not in res.TX90p.attrs
 
-    def test_index_tx90p__dask_bootstrap_uses_safe_tiled_path(
+    def test_index_tx90p__dask_bootstrap_uses_fast_tiled_path(
         self,
         monkeypatch,
     ) -> None:
@@ -782,7 +782,7 @@ class TestIntegration:
             "time_range": ("2042-01-01", "2045-12-31"),
             "base_period_time_range": ("2042-01-01", "2043-12-31"),
             "out_file": self.OUTPUT_FILE,
-            "slice_mode": "ms",
+            "slice_mode": "year",
         }
 
         monkeypatch.setenv("ICCLIM_BOOTSTRAP_MODE", "default")
@@ -794,7 +794,7 @@ class TestIntegration:
         profile = generic_functions.get_bootstrap_profile()
 
         assert not hasattr(default.TX90p.data, "__dask_graph__")
-        assert profile["bootstrap_safe_tile_count"] == 4
+        assert profile["bootstrap_fast_tile_count"] == 4
         xr.testing.assert_allclose(default.TX90p, legacy.TX90p)
 
     def test_index_tx90p__safe_bootstrap_uses_memory_budget(self, monkeypatch) -> None:
@@ -812,19 +812,20 @@ class TestIntegration:
             time_range=("2042-01-01", "2045-12-31"),
             base_period_time_range=("2042-01-01", "2043-12-31"),
             out_file=self.OUTPUT_FILE,
-            slice_mode="ms",
+            slice_mode="year",
         )
         profile = generic_functions.get_bootstrap_profile()
 
         assert not hasattr(res.TX90p.data, "__dask_graph__")
         assert profile["bootstrap_safe_max_tile_cells"] == 1
-        assert profile["bootstrap_safe_tile_count"] == 4
+        assert profile["bootstrap_fast_tile_count"] == 4
 
     def test_index_tx90p__safe_bootstrap_retries_on_memory_error(
         self,
         monkeypatch,
     ) -> None:
         monkeypatch.setenv("ICCLIM_BOOTSTRAP_SAFE_TILE_CELLS", "4")
+        monkeypatch.setenv("ICCLIM_BOOTSTRAP_MODE", "safe")
         tas = stub_tas(tas_value=27 + K2C, lat_length=2, lon_length=2)
         tas[5:10] = 0
         tas = tas.chunk({"time": 365, "lat": 1, "lon": 1})

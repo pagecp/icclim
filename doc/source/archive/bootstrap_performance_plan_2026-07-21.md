@@ -100,3 +100,39 @@ Before touching production runtime code, an optimized candidate must pass:
 - leap-year and 2-year/3-year overlap tests,
 - no returned huge dask graph,
 - fallback path preserved.
+
+## Candidate Implemented On `perf/bootstrap-analysis`
+
+Implemented a conservative exact fast path for annual percentile count indices:
+
+- only single day-of-year percentile thresholds,
+- only annual output for now,
+- only dask-backed count indices already routed through the safe bootstrap gate,
+- keeps the safe xclim tiled path available with `ICCLIM_BOOTSTRAP_MODE=safe`,
+- keeps the legacy xclim graph diagnostic path available with
+  `ICCLIM_BOOTSTRAP_MODE=default`,
+- falls back to safe xclim tiling for unsupported cases.
+
+The candidate computes each bounded spatial tile in memory, reuses xclim's exact
+`percentile_doy` and `resample_doy` kernels, and avoids building a large dask
+graph. It also caches the raw studied array only when that raw array fits within
+`ICCLIM_BOOTSTRAP_SAFE_TILE_MEMORY`; bootstrap temporaries remain tiled.
+
+Local real-NetCDF TG90P subset, same data as above:
+
+- hostile chunks (`time=365`, `lat=4`, `lon=4`), one tile, `512MB`:
+  fast `11.14s`, safe `12.10s`, exact (`max_abs_diff=0`).
+- good spatial chunks (`time=365`, `lat=99`, `lon=99`), one tile, `512MB`:
+  fast `2.36s`, safe `2.47s`, exact.
+- hostile chunks, forced 3 tiles, `10MB`:
+  fast with raw cache `11.43s`, safe `32.81s`, exact.
+
+Interpretation:
+
+- The arithmetic part is now very cheap on this subset; load/chunk topology is
+  the dominant cost.
+- Repeated tile reads were the major local multi-tile bottleneck. The raw-cache
+  guard removes that when the raw studied data fits the memory budget.
+- This is a useful speedup for tiled reliability mode, but it is not yet a full
+  large-domain performance solution. Kraken-scale tests still need peak memory
+  and wall-time validation.
