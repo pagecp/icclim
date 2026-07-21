@@ -139,7 +139,7 @@ def _tg90p_bootstrap_count_numpy_index(
     study_time = pd.DatetimeIndex(study.time.values)
     ref_year_indices = _indices_by_year(ref_time)
     study_year_indices = _indices_by_year(study_time)
-    sample_indices = _rolling_sample_indices_by_doy(ref_time, window=5)
+    sample_indices = _rolling_sample_index_matrix(ref_time, window=5)
     base_per = _percentiles_from_sample_indices(flat_ref, sample_indices)
 
     pieces = []
@@ -196,11 +196,11 @@ def _indices_by_year(time: pd.DatetimeIndex) -> dict[int, np.ndarray]:
     return {int(year): np.where(time.year == year)[0] for year in np.unique(time.year)}
 
 
-def _rolling_sample_indices_by_doy(
+def _rolling_sample_index_matrix(
     time: pd.DatetimeIndex,
     *,
     window: int,
-) -> dict[int, np.ndarray]:
+) -> np.ndarray:
     half_window = window // 2
     sample_indices: dict[int, list[int]] = {doy: [] for doy in range(1, 366)}
     doys = time.dayofyear.to_numpy()
@@ -210,18 +210,19 @@ def _rolling_sample_indices_by_doy(
         start = max(0, center - half_window)
         stop = min(len(time), center + half_window + 1)
         sample_indices[int(doy)].extend(range(start, stop))
-    return {
-        doy: np.asarray(indices, dtype=np.int64)
-        for doy, indices in sample_indices.items()
-    }
+    max_samples = max(len(indices) for indices in sample_indices.values())
+    matrix = np.full((365, max_samples), -1, dtype=np.int64)
+    for doy, indices in sample_indices.items():
+        matrix[doy - 1, : len(indices)] = indices
+    return matrix
 
 
 def _remap_target_year_indices(
-    sample_indices: dict[int, np.ndarray],
+    sample_indices: np.ndarray,
     ref_time: pd.DatetimeIndex,
     target_indices: np.ndarray,
     donor_indices: np.ndarray,
-) -> dict[int, np.ndarray]:
+) -> np.ndarray:
     index_map = np.arange(len(ref_time), dtype=np.int64)
     donor_map = _donor_indices_aligned_to_target(
         ref_time[target_indices],
@@ -229,7 +230,10 @@ def _remap_target_year_indices(
         donor_indices,
     )
     index_map[target_indices] = donor_map
-    return {doy: index_map[indices] for doy, indices in sample_indices.items()}
+    valid = sample_indices >= 0
+    remapped = np.full_like(sample_indices, -1)
+    remapped[valid] = index_map[sample_indices[valid]]
+    return remapped
 
 
 def _donor_indices_aligned_to_target(
@@ -260,21 +264,21 @@ def _donor_indices_aligned_to_target(
 
 def _percentiles_from_sample_indices(
     flat_ref: np.ndarray,
-    sample_indices: dict[int, np.ndarray],
+    sample_indices: np.ndarray,
 ) -> np.ndarray:
-    out = np.empty((365, flat_ref.shape[1]), dtype=flat_ref.dtype)
-    for doy, indices in sample_indices.items():
-        valid = indices[indices >= 0]
-        samples = flat_ref[valid]
-        out[doy - 1] = nan_calc_percentiles(
-            samples,
-            percentiles=[90],
-            axis=0,
-            alpha=1.0 / 3.0,
-            beta=1.0 / 3.0,
-            copy=True,
-        )[:, 0]
-    return out
+    valid = sample_indices >= 0
+    safe_indices = np.where(valid, sample_indices, 0)
+    samples = flat_ref[safe_indices].astype(float, copy=True)
+    samples[~valid] = np.nan
+    percentiles = nan_calc_percentiles(
+        samples,
+        percentiles=[90],
+        axis=1,
+        alpha=1.0 / 3.0,
+        beta=1.0 / 3.0,
+        copy=False,
+    )
+    return percentiles[..., 0].T
 
 
 def _count_year_exceedances(
