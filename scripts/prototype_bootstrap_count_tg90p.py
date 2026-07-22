@@ -157,6 +157,7 @@ def _tg90p_bootstrap_count_numpy_index(
     sample_indices = _rolling_sample_index_matrix(ref_time, window=5)
     source_max_doy = int(ref_time.dayofyear.max())
     base_per = _percentiles_from_sample_indices(flat_ref, sample_indices)
+    threshold_offset = _threshold_unit_offset(ref, study)
 
     pieces = []
     for year, study_indices in study_year_indices.items():
@@ -191,9 +192,10 @@ def _tg90p_bootstrap_count_numpy_index(
         else:
             flat_count = _count_year_exceedances(
                 year_values,
-                _convert_thresholds_like_icclim(base_per, ref, study),
+                base_per,
                 year_da.time.dt.dayofyear.to_numpy(),
                 target_max_doy,
+                threshold_offset,
             )
         pieces.append(flat_count.reshape(study.shape[1:]))
 
@@ -486,25 +488,23 @@ if njit is not None:
                 q = np.empty(365, dtype=np.float64)
                 buf = np.empty(max_samples, dtype=np.float64)
                 for doy_i in range(365):
-                    q[doy_i] = np.float32(
-                        _quantile_for_doy_cell(
-                            flat_ref,
-                            sample_indices,
-                            index_year,
-                            index_pos,
-                            donor_aligned,
-                            -1,
-                            -1,
-                            doy_i,
-                            cell,
-                            buf,
-                        )
-                        + threshold_offset
+                    q[doy_i] = _quantile_for_doy_cell(
+                        flat_ref,
+                        sample_indices,
+                        index_year,
+                        index_pos,
+                        donor_aligned,
+                        -1,
+                        -1,
+                        doy_i,
+                        cell,
+                        buf,
                     )
                 count = 0.0
                 for offset in range(length):
                     doy = study_doys[start + offset]
                     threshold = _adjusted_threshold(q, doy, max_target_doy)
+                    threshold = threshold + threshold_offset
                     if flat_study[start + offset, cell] > threshold:
                         count += 1.0
                 out[year_i, cell] = count
@@ -604,16 +604,16 @@ if njit is not None:
     @njit(cache=True)
     def _adjusted_threshold(q, doy, max_target_doy):
         if max_target_doy == 365:
-            return np.float32(q[doy - 1])
+            return q[doy - 1]
         position = (doy - 1.0) * 364.0 / 365.0
         lower = int(np.floor(position))
         if lower >= 364:
-            return np.float32(q[364])
+            return q[364]
         gamma = position - lower
         diff = q[lower + 1] - q[lower]
         if gamma >= 0.5:
-            return np.float32(q[lower + 1] - diff * (1.0 - gamma))
-        return np.float32(q[lower] + diff * gamma)
+            return q[lower + 1] - diff * (1.0 - gamma)
+        return q[lower] + diff * gamma
 
     @njit(parallel=True, cache=True)
     def _bootstrap_counts_numba_presort_kernel(  # noqa: C901
@@ -649,19 +649,17 @@ if njit is not None:
             if target_ref_i < 0:
                 q = np.empty(365, dtype=np.float64)
                 for doy_i in range(365):
-                    q[doy_i] = np.float32(
-                        _method8_quantile_90_from_sorted(
-                            sorted_samples,
-                            sample_counts,
-                            doy_i,
-                            cell,
-                        )
-                        + threshold_offset
+                    q[doy_i] = _method8_quantile_90_from_sorted(
+                        sorted_samples,
+                        sample_counts,
+                        doy_i,
+                        cell,
                     )
                 count = 0.0
                 for offset in range(length):
                     doy = study_doys[start + offset]
                     threshold = _adjusted_threshold(q, doy, max_target_doy)
+                    threshold = threshold + threshold_offset
                     if flat_study[start + offset, cell] > threshold:
                         count += 1.0
                 out[year_i, cell] = count
@@ -1076,8 +1074,11 @@ def _count_year_exceedances(
     percentile_by_doy: np.ndarray,
     year_doys: np.ndarray,
     max_target_doy: int,
+    threshold_offset: float = 0.0,
 ) -> np.ndarray:
     adjusted = _adjust_365_percentiles_to_target(percentile_by_doy, max_target_doy)
+    if threshold_offset != 0.0:
+        adjusted = adjusted.astype(np.float64) + threshold_offset
     threshold = adjusted[year_doys - 1]
     return np.sum(year_values > threshold, axis=0)
 
@@ -1092,7 +1093,7 @@ def _adjust_365_percentiles_to_target(
     target_x = np.arange(1, max_target_doy + 1)
     adjusted = np.empty(
         (max_target_doy, percentile_by_doy.shape[1]),
-        dtype=percentile_by_doy.dtype,
+        dtype=np.float64,
     )
     for cell in range(percentile_by_doy.shape[1]):
         adjusted[:, cell] = np.interp(target_x, source_x, percentile_by_doy[:, cell])

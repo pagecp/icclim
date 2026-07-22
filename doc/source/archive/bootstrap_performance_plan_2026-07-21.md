@@ -203,6 +203,20 @@ Follow-up result:
   It reduced meaningful differences from the previous prototype but still had
   three values above `1e-9` (`max_abs_diff=1.0`). Fresh one-cell safe controls
   were submitted for those coordinates before drawing a final conclusion.
+- A fresh one-cell safe control for the first full-subset mismatch was
+  OOM-killed at `32GB` before producing output. The `64GB` retry also ran for
+  more than half an hour and was OOM-killed before producing output. This
+  reinforces the original reliability problem: the safe path avoids huge dask
+  graphs by tiling, but xclim bootstrap work can still be memory-expensive and
+  slow even at very small spatial sizes.
+- Moving unit conversion after leap-year day-of-year interpolation and keeping
+  adjusted thresholds in float64 fixed the tested non-overlap boundary flips.
+  The latest full `28x21` hybrid prototype run took about `114.60s` and had only
+  one meaningful difference against cached legacy output, on a reference-period
+  bootstrap year. We decided not to chase exact legacy reproduction further
+  because the hybrid current behavior is scientifically inconsistent; future
+  work should move temperature percentile indices to a coherent Celsius-first
+  path.
 
 ## Useful Scripts
 
