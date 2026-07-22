@@ -217,6 +217,12 @@ Follow-up result:
   because the hybrid current behavior is scientifically inconsistent; future
   work should move temperature percentile indices to a coherent Celsius-first
   path.
+- Production direction changed accordingly: temperature standard-index data are
+  now normalized using the known standard variable, not only metadata guessing,
+  and temperature percentile thresholds are prepared from the full normalized
+  series so reference periods outside `time_range` remain valid. This makes base
+  and bootstrap percentile construction use the same Celsius-first scientific
+  convention.
 
 ## Useful Scripts
 

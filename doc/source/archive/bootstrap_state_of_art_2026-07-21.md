@@ -397,6 +397,12 @@ Follow-up exact-cell diagnostic:
   reference differences.
 - Therefore a production fast path must reproduce icclim's threshold preparation
   and xclim bootstrap recomputation order, not only the Zhang replacement rule.
+- After scientific review, we chose not to preserve this hybrid behavior as the
+  desired production target. For temperature percentile indices, icclim should
+  normalize both the study data and the full reference series to Celsius before
+  percentile construction. Exact legacy reproduction remains useful for
+  diagnostics, but the release-candidate behavior should be internally coherent
+  and scientifically explicit.
 
 Next diagnostic:
 
