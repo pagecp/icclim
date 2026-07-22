@@ -107,6 +107,7 @@ Kraken ACCESS-CM2 full-subset results:
 | xarray donor-year loop | cancelled after `~5m50s` | no huge returned graph | no result | Rejected. |
 | Numba full-sort prototype | `101.91s` total | about `1.1GB` observed earlier | mean `45.13414893808983` | Promising but not exact yet. |
 | Numba presorted replacement | `201.10s` total, `198.70s` compute | low-memory compiled path | mean `45.13414893808983` | Rejected; slower than full-sort. |
+| Numba rank-select prototype, Celsius-first medium subset | `39.59s` total | low-memory compiled path | exact vs safe within `1e-9` | Promising; `~7.4x` faster than safe on `8x5` ACCESS-CM2 subset. |
 
 ## Rejected Candidate: Xarray Donor-Year Loop
 
@@ -223,6 +224,26 @@ Follow-up result:
   series so reference periods outside `time_range` remain valid. This makes base
   and bootstrap percentile construction use the same Celsius-first scientific
   convention.
+
+## Follow-up After Celsius-first Merge
+
+After PR #422, old hybrid cached comparisons are no longer the right production
+reference. Fresh ACCESS-CM2 medium validation was run with Celsius-first
+threshold semantics:
+
+- subset: `lat 35:45`, `lon 0:10`, resulting shape `65x8x5`,
+- safe tiled reference: `293.80s`, mean `48.84263925729442`,
+- `bootstrap=False` lower bound: `48.81s`, mean `47.39730769230769`,
+- Numba full-sort: `45.34s`, `max_abs_diff=4.26e-14`,
+  `changed_cells_gt_1e-9=0`,
+- Numba rank-select: `39.59s`, `max_abs_diff=4.26e-14`,
+  `changed_cells_gt_1e-9=0`.
+
+The rank-select prototype replaces full insertion-sort percentile computation
+with selection of the two ranks needed by method-8 p90. It was exact on local
+smoke tests and the medium Kraken validation, and is the best current
+performance candidate. A larger safe-vs-rank-select validation was submitted
+next before considering production integration.
 
 ## Useful Scripts
 
