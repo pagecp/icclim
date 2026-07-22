@@ -238,12 +238,14 @@ threshold semantics:
   `changed_cells_gt_1e-9=0`,
 - Numba rank-select: `39.59s`, `max_abs_diff=4.26e-14`,
   `changed_cells_gt_1e-9=0`.
+- Larger rank-select validation on `lat 35:55`, `lon 0:20`, resulting shape
+  `65x16x11`: safe tiled reference `1473.38s`, Numba rank-select `48.13s`,
+  `max_abs_diff=5.68e-14`, `changed_cells_gt_1e-9=0`.
 
 The rank-select prototype replaces full insertion-sort percentile computation
 with selection of the two ranks needed by method-8 p90. It was exact on local
-smoke tests and the medium Kraken validation, and is the best current
-performance candidate. A larger safe-vs-rank-select validation was submitted
-next before considering production integration.
+smoke tests and the medium and larger Kraken validations, and is the best
+current performance candidate.
 
 ## Useful Scripts
 
