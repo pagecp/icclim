@@ -52,6 +52,15 @@ def _parse_args() -> argparse.Namespace:
         ],
         help="Prototype implementation to run.",
     )
+    parser.add_argument(
+        "--threshold-unit-path",
+        default="celsius-first",
+        choices=["celsius-first", "legacy-hybrid"],
+        help=(
+            "Use normalized Celsius reference data for threshold construction, or "
+            "the obsolete hybrid raw-reference path kept only for comparisons."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1118,6 +1127,7 @@ def main() -> None:
     da = raw_da
     if args.target_unit:
         da = convert_units_to(da, args.target_unit)
+    ref_da = raw_da if args.threshold_unit_path == "legacy-hybrid" else da
     open_end = time.perf_counter()
     compute_start = time.perf_counter()
     if args.engine == "xarray-loop":
@@ -1129,19 +1139,19 @@ def main() -> None:
         result = _tg90p_bootstrap_count_numpy_index(
             da,
             base_period=(args.base_period_start, args.base_period_end),
-            ref_da=raw_da,
+            ref_da=ref_da,
         )
     elif args.engine == "numpy-numba":
         result = _tg90p_bootstrap_count_numpy_numba(
             da,
             base_period=(args.base_period_start, args.base_period_end),
-            ref_da=raw_da,
+            ref_da=ref_da,
         )
     else:
         result = _tg90p_bootstrap_count_numpy_numba_presort(
             da,
             base_period=(args.base_period_start, args.base_period_end),
-            ref_da=raw_da,
+            ref_da=ref_da,
         )
     result.load()
     compute_end = time.perf_counter()
@@ -1149,6 +1159,7 @@ def main() -> None:
     summary: dict[str, object] = {
         "open_seconds": open_end - open_start,
         "engine": args.engine,
+        "threshold_unit_path": args.threshold_unit_path,
         "compute_seconds": compute_end - compute_start,
         "total_seconds": compute_end - open_start,
         "result_shape": tuple(int(x) for x in result.shape),
