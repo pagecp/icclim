@@ -48,6 +48,7 @@ def _parse_args() -> argparse.Namespace:
             "xarray-loop",
             "numpy-index",
             "numpy-numba",
+            "numpy-numba-select",
             "numpy-numba-presort",
         ],
         help="Prototype implementation to run.",
@@ -229,6 +230,7 @@ def _tg90p_bootstrap_count_numpy_numba(
     *,
     base_period: tuple[str, str],
     ref_da: xr.DataArray | None = None,
+    use_select_quantile: bool = False,
 ) -> xr.DataArray:
     study = da.load()
     ref = (ref_da if ref_da is not None else da).sel(time=slice(*base_period)).load()
@@ -298,6 +300,7 @@ def _tg90p_bootstrap_count_numpy_numba(
         study_to_ref,
         study_doys,
         _threshold_unit_offset(ref, study),
+        use_select_quantile,
     )
 
     data = result.reshape((len(study_years), *study.shape[1:]))
@@ -480,6 +483,7 @@ if njit is not None:
         study_to_ref,
         study_doys,
         threshold_offset,
+        use_select_quantile,
     ):
         n_years = len(study_starts)
         n_cells = flat_study.shape[1]
@@ -508,6 +512,7 @@ if njit is not None:
                         doy_i,
                         cell,
                         buf,
+                        use_select_quantile,
                     )
                 count = 0.0
                 for offset in range(length):
@@ -538,6 +543,7 @@ if njit is not None:
                                 doy_i,
                                 cell,
                                 buf,
+                                use_select_quantile,
                             )
                         )
                     count = 0.0
@@ -563,6 +569,7 @@ if njit is not None:
         doy_i,
         cell,
         buf,
+        use_select_quantile,
     ):
         n = 0
         for sample_i in range(sample_indices.shape[1]):
@@ -578,6 +585,8 @@ if njit is not None:
             if not np.isnan(value):
                 buf[n] = value
                 n += 1
+        if use_select_quantile:
+            return np.float32(_method8_quantile_90_select(buf, n))
         return np.float32(_method8_quantile_90(buf, n))
 
     @njit(cache=True)
@@ -609,6 +618,63 @@ if njit is not None:
         if gamma >= 0.5:
             return right - diff * (1.0 - gamma)
         return left + diff * gamma
+
+    @njit(cache=True)
+    def _method8_quantile_90_select(buf, n):
+        if n == 0:
+            return np.nan
+        if n == 1:
+            return buf[0]
+        q = 0.9
+        alpha = 1.0 / 3.0
+        beta = 1.0 / 3.0
+        virtual = n * q + (alpha + q * (1.0 - alpha - beta)) - 1.0
+        if virtual >= n - 1:
+            return _select_kth(buf, n, n - 1)
+        if virtual < 0:
+            return _select_kth(buf, n, 0)
+        previous = int(np.floor(virtual))
+        gamma = virtual - previous
+        left = _select_kth(buf, n, previous)
+        right = _select_kth(buf, n, previous + 1)
+        diff = right - left
+        if gamma >= 0.5:
+            return right - diff * (1.0 - gamma)
+        return left + diff * gamma
+
+    @njit(cache=True)
+    def _select_kth(buf, n, k):
+        left = 0
+        right = n - 1
+        while True:
+            if left == right:
+                return buf[left]
+            pivot_index = (left + right) // 2
+            pivot_index = _partition(buf, left, right, pivot_index)
+            if k == pivot_index:
+                return buf[k]
+            if k < pivot_index:
+                right = pivot_index - 1
+            else:
+                left = pivot_index + 1
+
+    @njit(cache=True)
+    def _partition(buf, left, right, pivot_index):
+        pivot_value = buf[pivot_index]
+        _swap(buf, pivot_index, right)
+        store_index = left
+        for i in range(left, right):
+            if buf[i] < pivot_value:
+                _swap(buf, store_index, i)
+                store_index += 1
+        _swap(buf, right, store_index)
+        return store_index
+
+    @njit(cache=True)
+    def _swap(buf, i, j):
+        value = buf[i]
+        buf[i] = buf[j]
+        buf[j] = value
 
     @njit(cache=True)
     def _adjusted_threshold(q, doy, max_target_doy):
@@ -1141,11 +1207,12 @@ def main() -> None:
             base_period=(args.base_period_start, args.base_period_end),
             ref_da=ref_da,
         )
-    elif args.engine == "numpy-numba":
+    elif args.engine in {"numpy-numba", "numpy-numba-select"}:
         result = _tg90p_bootstrap_count_numpy_numba(
             da,
             base_period=(args.base_period_start, args.base_period_end),
             ref_da=ref_da,
+            use_select_quantile=args.engine == "numpy-numba-select",
         )
     else:
         result = _tg90p_bootstrap_count_numpy_numba_presort(
